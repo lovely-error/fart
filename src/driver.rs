@@ -1498,6 +1498,27 @@ impl WorkGroupRef {
     }
     return ;
   } }
+  pub fn submit<Env>(&self, capture: Env, operation: Thunk) { unsafe {
+    let worker = loop { // todo: make work submission less contended
+      if let Some(worker) = (*self.0).worker_set.try_acquire_free_worker_mref() {
+        break worker
+      };
+    };
+    if !worker.flags.was_started() {
+      worker.start();
+    }
+    worker.with_synced_access(|worker|{
+      let inner_ctx = &mut *worker.inner_context_ptr.assume_init();
+      let frame_ = inner_ctx.allocator.alloc_task_frame(
+        align_of::<Env>(), size_of::<Env>(), addr_of!(capture).cast());
+      let frame = frame_.deref_mut();
+      frame.parent_task = Supertask::None;
+      let task = Task { action: Action::new(operation), task_frame_ptr: frame_ };
+      inner_ctx.workset.enque(task);
+    });
+    forget(capture);
+    return;
+  } }
   pub fn clone_ref(&self) -> Self { unsafe {
     (*(*self.0).worker_set.0.get()).liveness_count.fetch_add(1, Ordering::AcqRel);
     return bitcopy(self)
