@@ -805,6 +805,7 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
             Supertask::Task(task) => {
               let parent_task = task.deref();
               let parent_frame = parent_task.task_frame_ptr.deref();
+              fence(Ordering::Release);
               let remaining_subtasks_count =
                 parent_frame.subtask_count.fetch_sub(1, Ordering::Relaxed);
               let last_child = remaining_subtasks_count == 1;
