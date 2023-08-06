@@ -455,7 +455,7 @@ impl WorkerSet {
     let index_mask = 1u64 << index;
     let mask = !index_mask ;
     // we must see changes to indicies as immidiate thus acqrel
-    let _ = this.inline_free_indicies.fetch_and(mask, Ordering::SeqCst);
+    let _ = this.inline_free_indicies.fetch_and(mask, Ordering::Relaxed);
   }
   // true, if already occupied
   fn set_as_occupied(&self, index: u32) -> bool {
@@ -466,14 +466,14 @@ impl WorkerSet {
     // we mut see changes to indicies as immidiate or
     // some two wokers might end up aquiring third one and
     // that would be pretty bad
-    let old = this.inline_free_indicies.fetch_or(mask, Ordering::SeqCst);
+    let old = this.inline_free_indicies.fetch_or(mask, Ordering::Relaxed);
     let already_taken = old & mask != 0;
     return already_taken
   }
   fn try_acquire_free_worker_mref(&self) -> Option<&mut Worker> { unsafe {
     let this = &mut *self.0.get();
     let relevance_mask = u64::MAX << this.total_worker_count;
-    let mut indicies = this.inline_free_indicies.load(Ordering::SeqCst);
+    let mut indicies = this.inline_free_indicies.load(Ordering::Relaxed);
     loop {
       if indicies | relevance_mask == u64::MAX {
         // nothign to grab in inlines
@@ -484,7 +484,7 @@ impl WorkerSet {
       };
       let some_index = indicies.trailing_ones();
       let index_mask = 1u64 << some_index;
-      indicies = this.inline_free_indicies.fetch_or(index_mask, Ordering::SeqCst);
+      indicies = this.inline_free_indicies.fetch_or(index_mask, Ordering::Relaxed);
       let did_acquire = indicies & index_mask == 0;
       if !did_acquire { continue; }
 
