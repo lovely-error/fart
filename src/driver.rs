@@ -105,7 +105,7 @@ impl SubRegionAllocator {
     DEALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let (root,_) = object.destruct().get_components();
-    let i = (&*root.cast::<RegionMetadata>()).ref_count.fetch_sub(1, Ordering::AcqRel);
+    let i = (*root.cast::<RegionMetadata>()).ref_count.fetch_sub(1, Ordering::AcqRel);
     if i == 1 {
       self.give_page_for_recycle_impl(Block4KPtr(root.cast()));
     }
@@ -427,10 +427,10 @@ struct WorkerSetData {
 
 impl WorkerSet {
   fn inline_free_indicies(&self) -> &AtomicU64 {
-    &unsafe { &*self.0.get() }.inline_free_indicies
+    unsafe { &(*self.0.get()).inline_free_indicies }
   }
   fn total_worker_count(&self) -> u32 {
-    unsafe { &*self.0.get() }.total_worker_count
+    unsafe { (*self.0.get()).total_worker_count }
   }
   fn mref_worker_at_index(&self, index: u32) -> &mut Worker { unsafe {
     let this = &mut *self.0.get();
@@ -698,12 +698,12 @@ impl <const Capacity:usize> PageRerouter<Capacity> {
     loop {
       let maybe_donor = iter.next();
       if let Some(donor) = maybe_donor {
-        let maybe_page = (&mut **donor).try_drain_page();
+        let maybe_page = (**donor).try_drain_page();
         if let Some(page) = maybe_page {
           return page
         }
       } else {
-        let page = (&mut *self.ralloc).get_block();
+        let page = (*self.ralloc).get_block();
         return page
       };
     }
@@ -716,9 +716,8 @@ impl <const Capacity:usize> PageSource for PageRerouter<Capacity> {
 }
 
 
-type CommonWorkerInnerContext = WorkerInnerContext<4, TASK_CACHE_SIZE>;
-struct WorkerInnerContext<const S0:usize, const S1:usize> {
-  page_router: PageRerouter<S0>,
+type CommonWorkerInnerContext = WorkerInnerContext<TASK_CACHE_SIZE>;
+struct WorkerInnerContext<const S1:usize> {
   allocator: SubRegionAllocator,
   workset: TaskSet<S1>,
 }
@@ -729,17 +728,15 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
   (*(*worker.work_group).worker_set.0.get()).liveness_count.fetch_add(1, Ordering::AcqRel);
   let ok = core_affinity::set_for_current(worker.core_pin_id);
   assert!(ok, "failed to pin worker {} to core {:?}", worker.index, worker.core_pin_id);
-  let ralloc = addr_of_mut!((&mut *worker.work_group).ralloc);
+  let ralloc = addr_of_mut!((*worker.work_group).ralloc);
   let mut inner_context = {
     let mut ctx: CommonWorkerInnerContext = garbage!();
-    let router_ptr = addr_of_mut!(ctx.page_router);
-    router_ptr.write(PageRerouter::<4>::new(ralloc));
-    addr_of_mut!(ctx.allocator).write(SubRegionAllocator::new(router_ptr));
+    let sralloc = addr_of_mut!(ctx.allocator);
+    sralloc.write(SubRegionAllocator::new(ralloc));
     addr_of_mut!(ctx.workset).write(TaskSet::<TASK_CACHE_SIZE>{
       inline_tasks:InlineLoopBuffer::new(),
-      outline_tasks: Array::new(router_ptr)
+      outline_tasks: Array::new(sralloc)
     });
-    ctx.page_router.register(&mut ctx.workset.outline_tasks);
     ctx
   };
   worker.inner_context_ptr.write(addr_of_mut!(inner_context));
@@ -970,7 +967,7 @@ fn schedule_work<const C:usize>(
             subordinate_worker.start()
           }
           subordinate_worker.with_synced_access(|subordinate_worker|{
-            let src = &mut(&mut *((&mut *worker).inner_context_ptr).assume_init_read()).workset;
+            let src = &mut(*((*worker).inner_context_ptr).assume_init_read()).workset;
             let dest = &mut (*subordinate_worker.inner_context_ptr.assume_init()).workset;
             // todo: make transfers fast
             let mut task_limit = 0;
@@ -1163,7 +1160,7 @@ impl TaskContext {
       immidiate_state_ref.spawned_subtask_count += 1;
     }
 
-    let mut frame_ref = (*this.worker_inner_context_ref).allocator.alloc_task_frame(
+    let frame_ref = (*this.worker_inner_context_ref).allocator.alloc_task_frame(
       env_align, env_size, env_data);
     if !detached {
       frame_ref.deref_mut().parent_task = if immidiate_state_ref.parked_task.is_null() {
