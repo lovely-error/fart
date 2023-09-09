@@ -94,20 +94,18 @@ impl SubRegionAllocator {
         .ref_count.fetch_add(1, Ordering::AcqRel);
 
       self.allocation_tail = next_allocation_tail;
-      let dist = ptr as u64 - self.current_page_start as u64;
-      assert!(dist <= u16::MAX as u64);
 
-      return OpaqueRegionItemRef::new(self.current_page_start, dist as u16);
+      return OpaqueRegionItemRef::new(ptr);
     }
   }; }
   #[track_caller]
   pub fn dispose<T: RegionPtrObject>(&mut self, object: T) { unsafe {
     DEALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    let (root,_) = object.destruct().get_components();
-    let i = (*root.cast::<RegionMetadata>()).ref_count.fetch_sub(1, Ordering::AcqRel);
+    let rmtd = object.destruct().get_region_metadata_ptr();
+    let i = (*rmtd).ref_count.fetch_sub(1, Ordering::AcqRel);
     if i == 1 {
-      self.give_page_for_recycle_impl(Block4KPtr(root.cast()));
+      self.give_page_for_recycle_impl(Block4KPtr(rmtd.cast_mut().cast()));
     }
   } }
   fn drain_spare_page(&mut self) -> Option<Block4KPtr> { unsafe {
@@ -136,8 +134,8 @@ impl SubRegionAllocator {
       panic!("FIXME?:Cant allocate this much for a task frame.")
     }
     let region_ref = self.alloc_bytes(total_size, align_of::<TaskFrame>());
-    let frame_ptr = region_ref.deref();
-    let frame_ref = frame_ptr.cast::<TaskFrame>();
+    let frame = region_ref.bind_type::<TaskFrame>();
+    let frame_ref = frame.deref_raw();
     frame_ref.write(TaskFrame {
       parent_task: Supertask::None,
       subtask_count: AtomicU32::new(0),
@@ -147,7 +145,7 @@ impl SubRegionAllocator {
     let data_ptr = (*frame_ref).raw_ptr_to_data();
     copy_nonoverlapping(env_data, data_ptr, env_size);
 
-    return region_ref.bind_type()
+    return frame
   } }
 }
 
@@ -175,7 +173,7 @@ pub type UninitRegionPtr<T> = RegionItemRef<MaybeUninit<T>>;
 pub struct RegionItemRef<T>(OpaqueRegionItemRef, PhantomData<T>);
 impl <T> RegionItemRef<MaybeUninit<T>> {
   pub fn init(self, data: T) -> RegionItemRef<T> { unsafe {
-    self.0.deref().cast::<T>().write(data);
+    self.0.get_data_ptr().cast::<T>().write(data);
     return transmute(self)
   } }
 }
@@ -183,10 +181,13 @@ impl <T> RegionItemRef<T> {
   fn new_null() -> Self { Self(OpaqueRegionItemRef::new_null(), PhantomData) }
   fn is_null(&self) -> bool { self.0.is_null() }
   fn deref(&self) -> &T {
-    unsafe { &*self.0.deref().cast::<T>() }
+    unsafe { &*self.0.get_data_ptr().cast::<T>() }
   }
   fn deref_mut(&self) -> &mut T {
-    unsafe { &mut *self.0.deref().cast::<T>() }
+    unsafe { &mut *self.0.get_data_ptr().cast::<T>() }
+  }
+  fn deref_raw(&self) -> *mut T {
+    self.0.get_data_ptr().cast()
   }
 }
 impl <T> RegionPtrObject for RegionItemRef<T> {
@@ -204,22 +205,15 @@ impl OpaqueRegionItemRef {
     self.0 == 0
   }
   pub fn new(
-    region_start_addr: *mut u8,
-    byte_offset: u16,
+    region_segment_addr: *mut u8,
   ) -> Self {
-    let ptrint = (region_start_addr as u64) << 16;
-    let mtded = ptrint + byte_offset as u64;
-    return Self(mtded)
+    Self(region_segment_addr as u64)
   }
-  pub fn get_components(&self) -> (*mut (), u16) {
-    let mtd = self.0 & (1u64 << 16) - 1;
-    let ptr = (self.0 >> 16) as *mut ();
-    return (ptr, mtd as u16);
+  pub fn get_data_ptr(&self) -> *mut u8 {
+    self.0 as _
   }
-  pub fn deref(&self) -> *mut u8 {
-    let (ptr, off) = self.get_components();
-    let spot = unsafe { ptr.cast::<u8>().add(off as usize) };
-    return spot
+  fn get_region_metadata_ptr(&self) -> *const RegionMetadata {
+    (self.0 & !((1 << 12) - 1)) as *const RegionMetadata
   }
   pub fn bind_type<T>(self) -> RegionItemRef<T> {
     RegionItemRef(self, PhantomData)
@@ -285,16 +279,16 @@ fn test_acks_work() { unsafe {
   let boxess = boxes.as_mut_ptr().cast::<OpaqueRegionItemRef>();
   for i in 0 ..64-1 {
     let v = sralloc.alloc_bytes(16, 64);
-    let ptr = v.deref();
+    let ptr = v.get_data_ptr();
     *ptr.cast() = u16::MAX;
     boxess.add(i).write(v);
   }
   let above = sralloc.alloc_bytes(16, 64); // must cause page replace
-  above.deref().cast::<u16>().write(u16::MAX);
+  above.get_data_ptr().cast::<u16>().write(u16::MAX);
   boxess.add(63).write(above);
   for i in 0 .. 64 {
     let item = boxess.add(i).read();
-    let val = *item.deref().cast::<u16>();
+    let val = *item.get_data_ptr().cast::<u16>();
     assert!(val == u16::MAX);
     sralloc.dispose(item);
   }
@@ -997,7 +991,7 @@ pub struct Arc<T> { ref_count:AtomicU64, value:T }
 pub struct ArcBox<T>(OpaqueRegionItemRef, PhantomData<T>);
 impl <T>ArcBox<T> {
   fn as_mut_ptr(&mut self) -> *mut T { unsafe {
-    let val = &mut *self.0.deref().cast::<Arc<T>>();
+    let val = &mut *self.0.get_data_ptr().cast::<Arc<T>>();
     return addr_of_mut!(val.value)
   } }
 }
@@ -1008,14 +1002,14 @@ impl <T> AsMut<T> for ArcBox<T> {
 }
 impl <T> AsRef<T> for ArcBox<T> {
   fn as_ref(&self) -> &T { unsafe {
-    let val = &*self.0.deref().cast::<Arc<T>>();
+    let val = &*self.0.get_data_ptr().cast::<Arc<T>>();
     return &val.value
   } }
 }
 pub struct Boxed<T>(OpaqueRegionItemRef, PhantomData<T>);
 impl <T> Boxed<T> {
   fn as_mut_ptr(&mut self) -> *mut T { unsafe {
-    let val = &mut *self.0.deref().cast::<Arc<T>>();
+    let val = &mut *self.0.get_data_ptr().cast::<Arc<T>>();
     return addr_of_mut!(val.value)
   } }
 }
@@ -1026,7 +1020,7 @@ impl <T> AsMut<T> for Boxed<T> {
 }
 impl <T> AsRef<T> for Boxed<T> {
   fn as_ref(&self) -> &T { unsafe {
-    let val = &*self.0.deref().cast::<Arc<T>>();
+    let val = &*self.0.get_data_ptr().cast::<Arc<T>>();
     return &val.value
   } }
 }
@@ -1063,7 +1057,7 @@ impl TaskContext {
     let region = unsafe {
       (*this.worker_inner_context_ref).allocator.alloc_bytes(
         size_of::<(SyncedMtd, T)>(), align_of::<(SyncedMtd, T)>()) };
-    let (mtd, data_) = unsafe{&mut *region.deref().cast::<(SyncedMtd, T)>()};
+    let (mtd, data_) = unsafe{&mut *region.get_data_ptr().cast::<(SyncedMtd, T)>()};
     *mtd = SyncedMtd {
       ref_count:AtomicU32::new(1),
       active_readers_count: AtomicU32::new(0),
@@ -1103,7 +1097,7 @@ impl TaskContext {
     let this = &mut *self.0.get();
     let region_ref = (*this.worker_inner_context_ref).allocator.alloc_bytes(
       size_of::<T>(), align_of::<T>());
-    let loc = region_ref.deref();
+    let loc = region_ref.get_data_ptr();
     loc.cast::<T>().write(data);
     return Boxed(region_ref, PhantomData)
   } }
@@ -1116,14 +1110,14 @@ impl TaskContext {
     let this = &mut *self.0.get();
     let region_ref = (*this.worker_inner_context_ref).allocator.alloc_bytes(
       size_of::<Arc<T>>(), align_of::<Arc<T>>());
-    let loc = region_ref.deref();
+    let loc = region_ref.get_data_ptr();
     let box_ = loc.cast::<Arc<T>>();
     (*box_).ref_count = AtomicU64::new(1);
     addr_of_mut!((*box_).value).write(data);
     return ArcBox(region_ref, PhantomData)
   }; }
   pub fn dispose_rc_box<T>(&self, some_box: ArcBox<T>) { unsafe {
-    let val = &*some_box.0.deref().cast::<Arc<T>>();
+    let val = &*some_box.0.get_data_ptr().cast::<Arc<T>>();
     let rc = val.ref_count.fetch_sub(1, Ordering::AcqRel);
     if rc == 1 {
       let this = &mut *self.0.get();
@@ -1566,11 +1560,11 @@ fn one_shild_one_parent() {
 
 #[test]
 fn child_child_check_dead() {
-  const Limit:u64 = 4000;
+  const LIMIT:u64 = 4000;
   struct ParentData { counter: AtomicU64, }
   fn parent(ctx: &TaskContext) -> Continuation {
     let frame = ctx.access_frame_as_init::<ParentData>();
-    for _ in 0 .. Limit {
+    for _ in 0 .. LIMIT {
       ctx.spawn_subtask(&frame.counter, child);
     }
     return Continuation::then(check)
@@ -1584,7 +1578,7 @@ fn child_child_check_dead() {
     let frame = ctx.access_frame_as_init::<ParentData>();
     let val = frame.counter.load(Ordering::Relaxed);
 
-    assert!(val == Limit);
+    assert!(val == LIMIT);
 
     return Continuation::done()
   }
@@ -1621,7 +1615,7 @@ fn mem_locations() { unsafe {
 
 #[test]
 fn ref_sync() {
-  const LIMIT : usize = 1;
+  const LIMIT : usize = 1000;
   struct Ctx {
     sync_obj: Option<Isolated<Vec<u32>>>
   }
