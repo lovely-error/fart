@@ -61,11 +61,15 @@ impl SubRegionAllocator {
     self.current_page_start = new_page_ptr;
     {
       let ptr = &mut *new_page_ptr.cast::<RegionMetadata>();
-      ptr.ref_count = AtomicU16::new(0);
+      // this has to be born with ref count +1 to not allow for
+      // situation when other worker possesing objects within this region
+      // consumes this region . this would cause racing
+      ptr.ref_count = AtomicU16::new(1);
     };
     self.allocation_tail = new_page_ptr.add(size_of::<RegionMetadata>());
   } }
   #[track_caller]
+  #[inline(never)]
   pub fn alloc_bytes(
     &mut self,
     byte_size: usize,
@@ -73,7 +77,9 @@ impl SubRegionAllocator {
   ) -> OpaqueRegionItemRef { unsafe {
     ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
 
-    assert!(byte_size != 0);
+    assert!(
+      byte_size != 0,
+      "region byte allocator was not made to deal with 0 byte allocations");
     let mut reserved_space = size_of::<RegionMetadata>();
     reserved_space += offset_to_higher_multiple(reserved_space as u64, alignment) as usize;
     assert!(
@@ -87,7 +93,21 @@ impl SubRegionAllocator {
       let off = ptr_align_dist(ptr, alignment);
       ptr = ptr.add(off as usize);
       let next_allocation_tail = ptr.add(byte_size);
-      if next_allocation_tail as u64 >= (self.current_page_start as u64 + 4096) {
+      let exceeded_trivial_capacity =
+        next_allocation_tail as u64 >= (self.current_page_start as u64 + 4096);
+      if exceeded_trivial_capacity {
+        // here we need to release current page (effectively detaching it from this worker)
+        // and making current page amenable for consumption by last user of some object,
+        // residing within the region backed by current page.
+        // all regions have owning worker until they become full, at which point they
+        // have to be detached and recycled by last user (worker)
+        let prior_count = (*self.current_page_start.cast::<RegionMetadata>())
+          .ref_count.fetch_sub(1, Ordering::Relaxed);
+        if prior_count == 1 { // extremely rare situation , when we can reuse current page
+          fence(Ordering::Acquire); // lets see other uses as happened
+          self.allocation_tail = self.current_page_start.add(size_of::<RegionMetadata>());
+          continue;
+        }
         self.set_new_page(); continue;
       }
       let _ = (*self.current_page_start.cast::<RegionMetadata>())
@@ -101,13 +121,17 @@ impl SubRegionAllocator {
   #[track_caller]
   pub fn dispose<T: RegionPtrObject>(&mut self, object: T) { unsafe {
     DEALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-
-    let rmtd = object.destruct().get_region_metadata_ptr();
-    let i = (*rmtd).ref_count.fetch_sub(1, Ordering::AcqRel);
+    let rmtd = object.destruct();
+    self.dispose_common_impl(rmtd)
+  } }
+  #[inline(never)]
+  fn dispose_common_impl(&mut self, ptr: OpaqueRegionItemRef) {
+    let rmtd = ptr.get_region_metadata_ptr();
+    let i = unsafe { (*rmtd).ref_count.fetch_sub(1, Ordering::AcqRel) };
     if i == 1 {
       self.give_page_for_recycle_impl(Block4KPtr(rmtd.cast_mut().cast()));
     }
-  } }
+  }
   fn drain_spare_page(&mut self) -> Option<Block4KPtr> { unsafe {
     if self.free_list == null_mut() { return None }
     let page = self.free_list;
@@ -1628,7 +1652,7 @@ fn ref_sync() {
       ctx.spawn_subtask(smth_clone, |ctx|{
         let frame = ctx.access_frame_as_init::<Isolated<Vec<u32>>>();
         return Continuation::sync_mut(frame.clone_ref(), |val, ctx| {
-          val.push(0);
+          val.push(u32::MAX);
           let frame = ctx.access_frame_as_init::<Isolated<Vec<u32>>>();
           ctx.dispose_synced_data(unsafe { bitcopy(frame) });
           return Continuation::done();
@@ -1650,7 +1674,9 @@ fn ref_sync() {
     let frame = ctx.access_frame_as_init::<Ctx>();
     let obj = frame.sync_obj.as_ref().unwrap().clone_ref();
     return Continuation::sync_ref(obj, |val, ctx|{
-      println!("{:#?}", val);
+      for i in val {
+        assert!(*i == u32::MAX)
+      }
       let frame = ctx.access_frame_as_init::<Ctx>();
       let vec = frame.sync_obj.take().unwrap();
       ctx.dispose_synced_data(vec);
@@ -1664,7 +1690,7 @@ fn ref_sync() {
   unsafe {
     let relc = ALLOCATION_COUNT.load(Ordering::Relaxed);
     let acqc = DEALLOCATION_COUNT.load(Ordering::Relaxed);
-    println!("{} {}", acqc, relc);
+    // println!("{} {}", acqc, relc);
     assert!(relc == acqc);
   }
 }
