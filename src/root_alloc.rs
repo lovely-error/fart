@@ -1,7 +1,7 @@
 
-use std::{alloc::{alloc, Layout}, sync::atomic::{AtomicU16, Ordering, fence}, cell::UnsafeCell, thread, ptr::{null_mut, addr_of_mut, addr_of, slice_from_raw_parts}, mem::MaybeUninit};
+use std::{alloc::{alloc, Layout}, sync::atomic::{AtomicU16, Ordering, fence}, cell::UnsafeCell, thread, ptr::{null_mut, addr_of, slice_from_raw_parts}, mem::size_of};
 
-use crate::{cast, utils::PageSource};
+use crate::{cast, utils::InfailablePageSource};
 
 pub struct RootAllocator {
   super_page_start: UnsafeCell<*mut [u8;4096]>,
@@ -9,16 +9,16 @@ pub struct RootAllocator {
 }
 
 impl RootAllocator {
-  fn alloc_superpage() -> *mut () {
+  fn alloc_superpage() -> *mut u8 {
     let mem = unsafe { alloc(Layout::from_size_align_unchecked(1 << 21, 4096)) };
-    mem.cast()
+    mem
   }
   pub fn new() -> Self {
     Self {
       super_page_start: UnsafeCell::new(Self::alloc_superpage().cast()),
       offset: AtomicU16::new(0) }
   }
-  pub fn try_get_block(&self) -> Option<Block4KPtr> {
+  pub fn try_get_block_nonblocking(&self) -> Option<Block4KPtr> {
     let offset = self.offset.fetch_add(1 << 1, Ordering::Relaxed);
     let locked = offset & 1 == 1;
     if locked { return None }
@@ -42,12 +42,21 @@ impl RootAllocator {
   }
   pub fn get_block(&self) -> Block4KPtr {
     loop {
-      let maybe_page = self.try_get_block();
+      let maybe_page = self.try_get_block_nonblocking();
       if let Some(page) = maybe_page { return page }
     }
   }
 }
-pub struct Block4KPtr(pub(crate) *mut u8);
+pub struct Block4KPtr(*mut ());
+impl Block4KPtr {
+  pub fn new(ptr: *mut ()) -> Self {
+    assert!(ptr.is_aligned_to(4096), "misaligned ptr given to Block4KPtr");
+    return Self(ptr.cast())
+  }
+  pub fn get_ptr(&self) -> *mut u8 {
+    self.0 as _
+  }
+}
 
 // unsafe impl Send for RootAllocator {}
 unsafe impl Sync for RootAllocator {}
@@ -58,7 +67,7 @@ fn alloc_works() {
   // this will eat a lot of ram, fix it if not disposed properly
   const THREAD_COUNT:usize = 4096;
   let ralloc = RootAllocator::new();
-  let ptrs: [*mut u8;THREAD_COUNT] = [null_mut(); THREAD_COUNT];
+  let ptrs: [*mut u32;THREAD_COUNT] = [null_mut(); THREAD_COUNT];
   thread::scope(|s|{
     for i in 0 .. THREAD_COUNT {
       let unique_ref = &ralloc;
@@ -66,13 +75,13 @@ fn alloc_works() {
       s.spawn(move || {
         let ptr;
         loop {
-          if let Some(ptr_) = unique_ref.try_get_block() {
+          if let Some(ptr_) = unique_ref.try_get_block_nonblocking() {
             ptr = ptr_; break;
           };
         }
         let Block4KPtr(v) = ptr;
-        for ix in 0 .. 4096 {
-          unsafe { *v.cast::<u8>().add(ix) = i as u8; }
+        for ix in 0 .. (4096 / size_of::<u32>()) {
+          unsafe { *v.cast::<u32>().add(ix) = i as u32; }
         }
         unsafe { *cast!(fuck, *mut u64).add(i) = v as u64 };
       });
@@ -80,15 +89,15 @@ fn alloc_works() {
   });
   for i in 0 .. THREAD_COUNT {
     let ptr = ptrs[i];
-    let sl = unsafe { &*slice_from_raw_parts(ptr, 4096) };
+    let sl : &[u32] = unsafe { &*slice_from_raw_parts(ptr, 4096 / size_of::<u32>()) };
     for s in sl {
-        assert!(*s == i as u8, "threads got same memory region");
+        assert!(*s == i as u32, "threads got same memory region!!!");
     }
   }
 }
 
-impl PageSource for RootAllocator {
-  fn try_drain_page(&mut self) -> Option<Block4KPtr> {
-    self.try_get_block()
+impl InfailablePageSource for RootAllocator {
+  fn get_page(&mut self) -> Block4KPtr {
+    self.get_block()
   }
 }

@@ -1,4 +1,7 @@
-use std::{mem::{MaybeUninit, size_of, forget}, cell::UnsafeCell, ptr::{addr_of_mut, copy_nonoverlapping, addr_of}};
+use std::{
+  mem::{MaybeUninit, size_of, forget},
+  cell::UnsafeCell, ptr::{addr_of_mut, copy_nonoverlapping, addr_of}
+};
 
 
 
@@ -7,10 +10,10 @@ use std::{mem::{MaybeUninit, size_of, forget}, cell::UnsafeCell, ptr::{addr_of_m
 pub struct InlineLoopBuffer<const Capacity:usize, T>(
   UnsafeCell<InlineLoopBufferData<Capacity, T>>);
 struct InlineLoopBufferData<const Capacity:usize, T> {
-  items: [MaybeUninit<T>; Capacity],
   write_index: usize,
   read_index: usize,
   item_count: usize,
+  items: [MaybeUninit<T>; Capacity],
 }
 trait InlineLoopBufferDataAccessorImpl {
   fn get_internals(&mut self)
@@ -52,22 +55,17 @@ impl <const Capacity:usize, T> InlineLoopBuffer<Capacity, T> {
   } }
   pub fn pop_from_head(&self) -> Option<T> { unsafe {
     let this = &mut *self.0.get();
-    let mut result = MaybeUninit::<(T, bool)>::uninit();
-    let result_mref = &mut *result.as_mut_ptr();
-    let result_addr = addr_of_mut!(result_mref.0);
-    InlineLoopBuffer_pop_from_head_impl(
-      this, size_of::<T>(), Capacity, (result_addr.cast(), &mut result_mref.1));
-    let (value, did_write) = result.assume_init();
-    if did_write { return Some(value) }
+    let mut result = MaybeUninit::<T>::uninit();
+    let ok = InlineLoopBuffer_pop_from_head_impl(
+      this, size_of::<T>(), Capacity, result.as_mut_ptr().cast());
+    if ok { return Some(result.assume_init()) }
     return None
   }; }
   pub fn pop_from_tail(&self) -> Option<T> { unsafe {
     let this = &mut *self.0.get();
     let mut result = MaybeUninit::<T>::uninit();
-    let mut ok = false;
-    InlineLoopBuffer_pop_from_tail_impl(
-      this, size_of::<T>(), Capacity,
-      (result.as_mut_ptr().cast(), &mut ok));
+    let ok = InlineLoopBuffer_pop_from_tail_impl(
+      this, size_of::<T>(), Capacity, result.as_mut_ptr().cast());
     if ok { return Some(result.assume_init()) }
     return None
   } }
@@ -94,7 +92,7 @@ fn InlineLoopBuffer_push_impl(
 ) -> bool { unsafe {
   let (storage_ptr, write_index, _, item_count) = object.get_internals();
   if *item_count == max_capacity { return false };
-  let slot_ptr = storage_ptr.add(*write_index * item_byte_size);
+  let slot_ptr = storage_ptr.byte_add(*write_index * item_byte_size);
   copy_nonoverlapping(new_item_addr, slot_ptr, item_byte_size);
   let mut new_index = *write_index + 1;
   if new_index == max_capacity { new_index = 0 }
@@ -108,17 +106,17 @@ fn InlineLoopBuffer_pop_from_head_impl(
   object: &mut dyn InlineLoopBufferDataAccessorImpl,
   item_byte_size: usize,
   max_capacity: usize,
-  result_loc: (*mut u8, &mut bool)
-) { unsafe {
+  result_loc: *mut ()
+) -> bool { unsafe {
   let (storage_ptr, _, read_index, item_count) = object.get_internals();
-  if *item_count == 0 { *result_loc.1 = false; return }
-  let slot_ptr = storage_ptr.add(*read_index * item_byte_size);
-  copy_nonoverlapping(slot_ptr, result_loc.0, item_byte_size);
+  if *item_count == 0 { return false }
+  let slot_ptr = storage_ptr.byte_add(*read_index * item_byte_size);
+  copy_nonoverlapping(slot_ptr.cast::<u8>(), result_loc.cast::<u8>(), item_byte_size);
   let mut new_read_index = *read_index + 1;
   if new_read_index == max_capacity { new_read_index = 0 };
   *read_index = new_read_index;
   *item_count -= 1;
-  *result_loc.1 = true;
+  return true
 } }
 
 #[inline(never)]
@@ -126,16 +124,16 @@ fn InlineLoopBuffer_pop_from_tail_impl(
   object: &mut dyn InlineLoopBufferDataAccessorImpl,
   item_byte_size: usize,
   max_capacity: usize,
-  result_loc: (*mut u8, &mut bool)
-) { unsafe {
+  result_loc: *mut ()
+) -> bool { unsafe {
   let (storage_ptr, write_index, _, item_count) = object.get_internals();
-  if *item_count == 0 { *result_loc.1 = false; return }
+  if *item_count == 0 { return false }
   let index = if *write_index == 0 { max_capacity } else {*write_index} - 1;
-  let slot_ptr = storage_ptr.add(index * item_byte_size);
-  copy_nonoverlapping(slot_ptr, result_loc.0, item_byte_size);
+  let slot_ptr = storage_ptr.byte_add(index * item_byte_size);
+  copy_nonoverlapping(slot_ptr.cast::<u8>(), result_loc.cast::<u8>(), item_byte_size);
   *write_index = index;
   *item_count -= 1;
-  *result_loc.1 = true;
+  return true
 } }
 
 #[test]
@@ -264,5 +262,22 @@ fn iter_over_loop() {
   for _ in 0 .. 10 {
     let val = *iter.next().unwrap();
     assert!(val == u8::MAX)
+  }
+}
+
+#[test]
+fn iter_over_loop2() {
+
+  const LIMIT : usize = 1000;
+  let buf = InlineLoopBuffer::<LIMIT, usize>::new();
+
+  for i in 0 .. LIMIT {
+    let ok = buf.push_to_tail(i);
+    assert!(ok);
+  }
+  for i in 0 .. LIMIT {
+    let v = buf.pop_from_head();
+    if v.is_none() { panic!() }
+    assert!(v.unwrap() == i)
   }
 }
