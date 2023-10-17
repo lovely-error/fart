@@ -1,6 +1,6 @@
 use std::{
   mem::{MaybeUninit, size_of, forget},
-  cell::UnsafeCell, ptr::{addr_of_mut, copy_nonoverlapping, addr_of}
+  cell::UnsafeCell, ptr::{addr_of_mut, copy_nonoverlapping, addr_of}, simd::Simd
 };
 
 
@@ -44,6 +44,14 @@ impl <const Capacity:usize, T> InlineLoopBuffer<Capacity, T> {
         write_index: 0,
         read_index: 0,
         item_count: 0 }))
+  } }
+  pub fn insert_pack(&self, pack: Simd<u64,32>, len: u8) { unsafe {
+    let this = &mut *self.0.get();
+    this.read_index = 0;
+    this.write_index = 0;
+    this.item_count = len as usize;
+    let ptr = this.items.as_mut_ptr().cast::<Simd<u64, 32>>();
+    ptr.write_unaligned(pack);
   } }
   // true if pushing was successful
   pub fn push_to_tail(&self, new_item: T) -> bool { unsafe {

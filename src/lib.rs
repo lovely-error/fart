@@ -8,6 +8,7 @@
 #![feature(const_trait_impl)]
 #![feature(const_mut_refs)]
 #![feature(ptr_alignment_type)]
+#![feature(portable_simd)]
 
 pub mod driver;
 mod root_alloc;
