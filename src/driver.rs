@@ -1,5 +1,18 @@
 
-use std::{sync::{atomic::{AtomicU16, Ordering, fence, AtomicU64, AtomicU32, AtomicU8, AtomicBool, }, mpsc::{Receiver, channel, Sender}}, mem::{size_of, MaybeUninit, forget,  transmute, align_of, transmute_copy, needs_drop, ManuallyDrop}, ptr::{addr_of, null_mut, copy_nonoverlapping, addr_of_mut }, thread::{JoinHandle, self, park, Thread, spawn, current, yield_now}, cell::UnsafeCell, alloc::{alloc, Layout}, marker::PhantomData, time::Duration,  collections::HashMap, os::fd::RawFd, simd::Simd};
+use std::{
+  sync::{
+    atomic::{AtomicU16, Ordering, fence, AtomicU64, AtomicU32, AtomicU8, AtomicBool, },
+    mpsc::{Receiver, channel, Sender}
+  },
+  mem::{
+    size_of, MaybeUninit, forget,  transmute, align_of, transmute_copy, needs_drop, ManuallyDrop
+  },
+  ptr::{addr_of, null_mut, copy_nonoverlapping, addr_of_mut },
+  thread::{JoinHandle, self, park, Thread, spawn, current, yield_now},
+  cell::UnsafeCell,
+  alloc::{alloc, Layout},
+  marker::PhantomData, time::{Duration, Instant},  collections::HashMap, os::fd::RawFd, simd::Simd
+};
 
 use core_affinity::CoreId;
 use polling::{Poller, Source, Event};
@@ -289,14 +302,12 @@ fn io_polling_routine(this: &mut IOPollingWorker) { unsafe {
           std::sync::mpsc::TryRecvError::Disconnected => {
             return
           },
-          std::sync::mpsc::TryRecvError::Empty => {
-
-          }
+          std::sync::mpsc::TryRecvError::Empty => ()
         }
       }
     }
     gathered_events.clear();
-    poller.wait(&mut gathered_events, Some(Duration::from_secs(0))).unwrap();
+    poller.wait(&mut gathered_events, Some(Duration::from_millis(100))).unwrap();
     let no_continuations_to_resume = gathered_events.is_empty();
     if no_continuations_to_resume && pending_tasks.is_empty() {
       let _ =
@@ -337,14 +348,11 @@ fn io_polling_routine(this: &mut IOPollingWorker) { unsafe {
   }
 } }
 
-
-const ASSUMED_NUMBER_OF_CORES_ON_AVERAGE_MODERN_MACHINE : usize = 16;
 struct WorkerSet(UnsafeCell<WorkerSetData>);
 struct WorkerSetData {
-  inline_workers: [MaybeUninit<Worker>; ASSUMED_NUMBER_OF_CORES_ON_AVERAGE_MODERN_MACHINE],
-  outline_workers: Option<Array<Worker>>,
+  workers: Vec<Worker>,
   inline_free_indicies: AtomicU64,
-  outline_free_indicies: Option<Array<AtomicU64>>,
+  outline_free_indicies: Option<Vec<AtomicU64>>,
   total_worker_count: u32,
   liveness_count: AtomicU16,
   io_thread: IOPollingWorker // sorry :(
@@ -353,70 +361,79 @@ struct WorkerSetData {
 impl WorkerSet {
   fn mref_worker_at_index(&self, index: u32) -> &mut Worker { unsafe {
     let this = &mut *self.0.get();
-    let work_count = this.total_worker_count;
-    if index >= work_count { panic!("invalid worker index") }
-    if index < work_count {
-      let ptr = addr_of_mut!(this.inline_workers).cast::<Worker>();
-      let worker = &mut *ptr.add(index as usize );
-      return worker
-    } else {
-      if let Some(w) = &this.outline_workers {
-        let worker = w.ref_item_at_index(
-          index as usize - ASSUMED_NUMBER_OF_CORES_ON_AVERAGE_MODERN_MACHINE).unwrap();
-        return &mut *worker;
-      };
-      panic!()
-    };
-  }; }
-  fn set_as_free(&self, index: u32) -> bool {
+    this.workers.get_unchecked_mut(index as usize)
+  } }
+  fn set_as_free(&self, worker_index: u32) -> bool {
     let this = unsafe { &mut *self.0.get() };
-    if index >= this.total_worker_count { panic!("invalid worker index") }
 
-    let index_mask = 1u64 << index;
+    let map = if this.total_worker_count > 64 {
+      let outlines = this.outline_free_indicies.as_ref().unwrap();
+      let ix = (worker_index / 64) - 1;
+      let ptr = outlines.get(ix as usize).unwrap();
+      ptr
+    } else {
+      &this.inline_free_indicies
+    };
+    let index_mask = 1u64 << worker_index;
     let mask = !index_mask ;
-    let prior = this.inline_free_indicies.fetch_and(mask, Ordering::Relaxed);
+    let prior = map.fetch_and(mask, Ordering::Relaxed);
     let all_idle = prior & mask == 0;
     all_idle
   }
   fn try_find_free_worker_index(&self) -> Option<u64> { unsafe {
-    let total_worker_count = (*self.0.get()).total_worker_count;
-    let map = &(*self.0.get()).inline_free_indicies;
-    let mut indicies : u64 = 0;
-    let outcome = map.compare_exchange(0, 0, Ordering::Relaxed, Ordering::Relaxed);
-    match outcome {
-      Ok(_) => (),
-      Err(real) => indicies = real,
-    }
-    loop {
-      let some_index = indicies.trailing_ones();
-      if some_index == total_worker_count { return None }
-      let index_mask = 1u64 << some_index;
-      let new_val = indicies | index_mask;
-      let outcome =
-        map.compare_exchange(indicies, new_val, Ordering::Relaxed, Ordering::Relaxed);
-      match outcome {
-        Ok(_) => {
-          return Some(some_index as _);
-        },
-        Err(real) => {
-          indicies = real;
-          continue;
-        },
+    let inner = &mut *self.0.get();
+    let total_worker_count = inner.total_worker_count;
+    let mut limit = total_worker_count;
+    let limit_ = if total_worker_count / 64 > 0 { 64 } else { total_worker_count };
+    let ix = find_free_index(&inner.inline_free_indicies, limit_);
+    if ix.is_some() { return ix }
+    if let Some(outline) = &inner.outline_free_indicies {
+      limit -= 64;
+      let limit_ = if limit > 64 { 64 } else { limit };
+      for i in outline {
+        let ix = find_free_index(i, limit_);
+        if ix.is_some() { return ix }
+        limit -= 64;
       }
     }
+    return None;
   } }
   fn try_acquire_free_worker_mref(&self) -> Option<&mut Worker> { unsafe {
     let this = &mut *self.0.get();
     let outcome = self.try_find_free_worker_index();
     match outcome {
       Some(index) => {
-        let ptr = this.inline_workers.as_mut_ptr().add(index as usize);
-        let ptr = (*ptr).assume_init_mut();
+        let ptr = this.workers.get_unchecked_mut(index as usize);
         return Some(ptr)
       },
       None => return None,
     }
   } }
+}
+fn find_free_index(map: &AtomicU64, total_worker_count: u32) -> Option<u64> {
+  let mut indicies : u64 = 0;
+  let outcome = map.compare_exchange(0, 0, Ordering::Relaxed, Ordering::Relaxed);
+  match outcome {
+    Ok(_) => (),
+    Err(real) => indicies = real,
+  }
+  loop {
+    let some_index = indicies.trailing_ones();
+    if some_index == total_worker_count { return None }
+    let index_mask = 1u64 << some_index;
+    let new_val = indicies | index_mask;
+    let outcome =
+      map.compare_exchange_weak(indicies, new_val, Ordering::Relaxed, Ordering::Relaxed);
+    match outcome {
+      Ok(_) => {
+        return Some(some_index as _);
+      },
+      Err(real) => {
+        indicies = real;
+        continue;
+      },
+    }
+  }
 }
 struct TaskSet {
   inline_tasks: InlineLoopBuffer<TASK_CACHE_SIZE, Task>,
@@ -723,6 +740,7 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
   'dispatch:loop {
     match exec_state {
       ExecState::Fetch => {
+        share_work(worker_set, &mut*workset_);
         if let Some(task) = (*workset_).deque_one() {
           immidiate_state.current_task.write(task);
           exec_state = ExecState::Execute;
@@ -738,14 +756,6 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
       },
       ExecState::Sleep => {
         let _ = worker.mark_as_free();
-        // let rc = &(*(*worker.work_group).worker_set.0.get()).liveness_count;
-        // let outcome = rc.compare_exchange(0, 0, Ordering::Relaxed, Ordering::Relaxed);
-        // let should_terminate_self = all_idle && outcome.is_ok();
-        // if should_terminate_self {
-        //   // release resources
-        //   return;
-        // }
-        //
         loop {
           if worker.flags.has_transaction_began() {
             while !worker.flags.has_trunsaction_ended() {}
@@ -768,6 +778,7 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
           match continuation {
             ContinuationRepr::Then(thunk) => {
               let next = thunk(&task_context);
+              fence(Ordering::Release);
               let produced_subtasks = immidiate_state.spawned_subtask_count != 0;
               if produced_subtasks {
                 let current_task = immidiate_state.current_task.assume_init_read();
@@ -776,7 +787,6 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
                 frame.subtask_count.store(
                   immidiate_state.spawned_subtask_count as u32, Ordering::Relaxed);
                 frame.continuation = next;
-                share_work(worker_set, &mut*workset_);
                 task_context.clear_dirty_state();
                 exec_state = ExecState::Fetch;
                 continue 'dispatch;
@@ -800,7 +810,6 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
                 Supertask::Parent(parked_task_ref) => {
                   let parent_task = parked_task_ref.bitcopy();
                   let parent_frame = parent_task.deref_mut();
-                  fence(Ordering::Release);
                   let remaining_subtasks_count =
                     parent_frame.subtask_count.fetch_sub(1, Ordering::Relaxed);
                   let last_child = remaining_subtasks_count == 1;
@@ -1049,7 +1058,7 @@ impl TaskContext {
     forget(env)
   }
   // parent does not depend on this subtask
-  pub fn spawn_detached_task<T:Send>(&self, env: T, thunk: Thunk) {
+  pub fn spawn_detached_task<T: Send>(&self, env: T, thunk: Thunk) {
     self.spawn_task_common_impl(
       addr_of!(env).cast::<()>(),
       size_of::<T>(), align_of::<T>(), thunk, true);
@@ -1191,7 +1200,7 @@ impl WorkGroup {
     }
     return core_ids
   }
-  pub fn new_with_thread_count(thread_count:usize)
+  fn new_with_thread_count(thread_count:usize)
     -> Result<WorkGroupRef, WorkGroupCreationError> {
       if thread_count == 0 { return Err(WorkGroupCreationError::RequestedZeroWorkers);}
     let core_ids = Self::get_core_ids();
@@ -1215,11 +1224,27 @@ impl WorkGroup {
       Layout::from_size_align_unchecked(size_of::<WG>(), align_of::<WG>()));
     let boxed = boxed.cast::<WG>();
     let (send, recv) = channel();
+
+    let mut workers = Vec::new();
+    workers.reserve(worker_count);
+    for wix in 0 .. worker_count as u32 {
+      let pin = core_ids.get(wix as usize).unwrap().clone();
+      let worker = Worker {
+        index: wix,
+        runner_handle: None,
+        work_group: boxed,
+        flags: WorkerFlags::new(),
+        inner_context_ptr: MaybeUninit::uninit(),
+        core_pin_id: pin,
+        io_tasks_sink: send.clone()
+      };
+      workers.push(worker);
+    }
+
     boxed.write(WorkGroup {
       ralloc:RootAllocator::new(),
       worker_set: WorkerSet(UnsafeCell::new(WorkerSetData {
-        inline_workers:MaybeUninit::uninit().assume_init(),
-        outline_workers: None,
+        workers: workers,
         inline_free_indicies: AtomicU64::new(0),
         outline_free_indicies: None,
         total_worker_count: worker_count as u32,
@@ -1234,27 +1259,11 @@ impl WorkGroup {
         liveness_count: AtomicU16::new(1) // +1 because ref exist
       })),
     });
-
     (*(*boxed).worker_set.0.get()).io_thread.start();
-
-    for wix in 0 .. worker_count as u32 {
-      let wref = (*boxed).worker_set.mref_worker_at_index(wix);
-      let pin = core_ids.get(wix as usize).unwrap().clone();
-      let worker = Worker {
-        index: wix,
-        runner_handle: None,
-        work_group: boxed,
-        flags: WorkerFlags::new(),
-        inner_context_ptr: MaybeUninit::uninit(),
-        core_pin_id: pin,
-        io_tasks_sink: send.clone()
-      };
-      cast!(wref, *mut Worker).write(worker);
-    }
 
     return WorkGroupRef(boxed)
   } }
-  pub fn destroy(&self) { unsafe {
+  fn destroy(&self) { unsafe {
     let workeset = &mut *self.worker_set.0.get();
     while workeset.inline_free_indicies.compare_exchange(
       0, 0, Ordering::Relaxed, Ordering::Relaxed).is_err() {
@@ -1279,7 +1288,7 @@ impl WorkGroup {
 }
 pub struct WorkGroupRef(*mut WorkGroup);
 impl WorkGroupRef {
-  pub fn submit_and_await<Env>(&self, capture: Env, operation: Thunk) { unsafe {
+  pub fn submit_and_await<Env: Send>(&self, capture: Env, operation: Thunk) { unsafe {
     let worker = loop { // todo: make work submission less contended
       if let Some(worker) = (*self.0).worker_set.try_acquire_free_worker_mref() {
         break worker
@@ -1317,7 +1326,7 @@ impl WorkGroupRef {
     }
     return ;
   } }
-  pub fn submit<Env>(&self, capture: Env, operation: Thunk) { unsafe {
+  pub fn submit<Env: Send>(&self, capture: Env, operation: Thunk) { unsafe {
     let worker = loop { // todo: make work submission less contended
       if let Some(worker) = (*self.0).worker_set.try_acquire_free_worker_mref() {
         break worker
@@ -1510,28 +1519,72 @@ fn mem_locations() { unsafe {
 // }
 
 #[test]
-fn race_on_trivial1() {
-  let wg = WorkGroup::new_with_thread_count(6).unwrap();
+fn heavy_spawning() {
+  let wg = WorkGroup::new();
   let counter = AtomicU64::new(0);
   const LIMIT : u64 = 1_000_000 ;
-  wg.submit_and_await(&counter, |ctx| {
-      let ptr = ctx.access_frame_as_init::<&AtomicU64>();
+  struct Data<'i> { counter_ref: &'i AtomicU64, start_time: Option<Instant> }
+  wg.submit_and_await(Data {counter_ref:&counter, start_time:None}, |ctx| {
+      let data = ctx.access_frame_as_init::<Data>();
+      data.start_time = Some(Instant::now());
       for _ in 0 .. LIMIT {
-          let ptr = ptr.clone();
+          let ptr = data.counter_ref;
           ctx.spawn_subtask(ptr, |ctx|{
               let ptr = ctx.access_frame_as_init::<&AtomicU64>();
               ptr.fetch_add(1, Ordering::Relaxed);
               return Continuation::done()
           })
       }
-      return Continuation::done()
+      return Continuation::then(|ctx| {
+        let data = ctx.access_frame_as_init::<Data>();
+        let el = data.start_time.unwrap().elapsed();
+        println!("time spent {:?}", el);
+        return Continuation::done();
+      })
   });
   let val = counter.load(Ordering::Relaxed);
-  println!("{}", val);
-  // assert!(val == LIMIT);
-  // unsafe { println!(
-  //     "sent to recycle {} ; taken from recycle {}",
-  //     GIVEN_FOR_RECYCLE_COUNT.load(Ordering::Relaxed),
-  //     TAKEN_FROM_RECYCLE_COUNT.load(Ordering::Relaxed)) }
+  // println!("{}", val);
+  assert!(val == LIMIT);
 }
 
+
+#[test]
+fn subsyncing() {
+  const LIMIT : usize = 1_000_000;
+  let wg = WorkGroup::new();
+  let mut st = Vec::<[usize;16]>::new();
+  st.reserve(LIMIT);
+  struct Data { start_time: Option<Instant>, items: Vec<[usize;16]> }
+  wg.submit_and_await(Data {items: st, start_time:None}, |ctx| {
+      let data = ctx.access_frame_as_init::<Data>();
+      data.start_time = Some(Instant::now());
+      let ptr = data.items.as_mut_ptr();
+      for i in 0 .. LIMIT {
+          let ptr = unsafe{ptr.add(i)};
+          let addr : usize = unsafe { transmute(ptr) };
+          ctx.spawn_subtask((addr, i), |ctx|{
+              let ptr = ctx.access_frame_as_init::<(usize, usize)>();
+              let addr = ptr.0;
+              let i = ptr.1;
+              let item_ptr : *mut [usize;16] = unsafe { transmute(addr) };
+              unsafe {item_ptr.write([i;16])};
+              return Continuation::done()
+          })
+      }
+      return Continuation::then(|ctx| {
+        let data = ctx.access_frame_as_init::<Data>();
+        let el = data.start_time.unwrap().elapsed();
+        println!("time spent {:?}", el);
+        unsafe { data.items.set_len(LIMIT) };
+        let mut ix : usize = 0;
+        let mut iter = data.items.iter();
+        while let Some(item) = iter.next() {
+          for i in item {
+            assert!(*i == ix)
+          }
+          ix += 1
+        }
+        return Continuation::done();
+      })
+  });
+}
