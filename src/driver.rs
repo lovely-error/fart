@@ -319,7 +319,7 @@ fn io_polling_routine(this: &mut IOPollingWorker) { unsafe {
     let no_resume_batch = batch_for_resume.is_empty();
     if !no_resume_batch {
       if let Some(free_worker) = (*this.work_group).worker_set.try_acquire_free_worker_mref() {
-        if !free_worker.flags.was_started() { free_worker.start() }
+        free_worker.start();
         free_worker.with_synced_access(|worker| {
           let inner_ctx = &mut (*worker.inner_context_ptr.assume_init());
           let mut pager = PageRouter(||{
@@ -351,9 +351,6 @@ struct WorkerSetData {
 }
 
 impl WorkerSet {
-  fn total_worker_count(&self) -> u32 {
-    unsafe { (*self.0.get()).total_worker_count }
-  }
   fn mref_worker_at_index(&self, index: u32) -> &mut Worker { unsafe {
     let this = &mut *self.0.get();
     let work_count = this.total_worker_count;
@@ -381,45 +378,46 @@ impl WorkerSet {
     let all_idle = prior & mask == 0;
     all_idle
   }
-  // true, if already occupied
-  fn set_as_occupied(&self, index: u32) -> bool {
-    let this = unsafe { &mut *self.0.get() };
-    if index >= this.total_worker_count { panic!("invalid index of worker") }
-
-    let mask = 1u64 << index;
-    // we mut see changes to indicies as immidiate or
-    // some two wokers might end up aquiring third one and
-    // that would be pretty bad
-    let old = this.inline_free_indicies.fetch_or(mask, Ordering::Relaxed);
-    let already_taken = old & mask != 0;
-    return already_taken
-  }
+  fn try_find_free_worker_index(&self) -> Option<u64> { unsafe {
+    let total_worker_count = (*self.0.get()).total_worker_count;
+    let map = &(*self.0.get()).inline_free_indicies;
+    let mut indicies : u64 = 0;
+    let outcome = map.compare_exchange(0, 0, Ordering::Relaxed, Ordering::Relaxed);
+    match outcome {
+      Ok(_) => (),
+      Err(real) => indicies = real,
+    }
+    loop {
+      let some_index = indicies.trailing_ones();
+      if some_index == total_worker_count { return None }
+      let index_mask = 1u64 << some_index;
+      let new_val = indicies | index_mask;
+      let outcome =
+        map.compare_exchange(indicies, new_val, Ordering::Relaxed, Ordering::Relaxed);
+      match outcome {
+        Ok(_) => {
+          return Some(some_index as _);
+        },
+        Err(real) => {
+          indicies = real;
+          continue;
+        },
+      }
+    }
+  } }
   fn try_acquire_free_worker_mref(&self) -> Option<&mut Worker> { unsafe {
     let this = &mut *self.0.get();
-    let relevance_mask = u64::MAX << this.total_worker_count;
-    let mut indicies = this.inline_free_indicies.load(Ordering::Relaxed);
-    loop {
-      if indicies | relevance_mask == u64::MAX {
-        // nothign to grab in inlines
-        if let Some(_) = this.outline_workers {
-          todo!()
-        }
-        return None ;
-      };
-      let some_index = indicies.trailing_ones();
-      let index_mask = 1u64 << some_index;
-      indicies = this.inline_free_indicies.fetch_or(index_mask, Ordering::Relaxed);
-      let did_acquire = indicies & index_mask == 0;
-      if !did_acquire { continue; }
-
-      let ptr = this.inline_workers.as_ptr().add(some_index as usize);
-      let ptr = ptr.cast::<Worker>() as *mut _;
-      let val = &mut *ptr;
-      return Some(val)
+    let outcome = self.try_find_free_worker_index();
+    match outcome {
+      Some(index) => {
+        let ptr = this.inline_workers.as_mut_ptr().add(index as usize);
+        let ptr = (*ptr).assume_init_mut();
+        return Some(ptr)
+      },
+      None => return None,
     }
   } }
 }
-
 struct TaskSet {
   inline_tasks: InlineLoopBuffer<TASK_CACHE_SIZE, Task>,
   outline_tasks: TaskCombiner,
@@ -524,9 +522,6 @@ impl Worker {
     unsafe{&(*self.work_group).ralloc}
   }
   // false if already occupied
-  fn mark_as_occupied(&self) -> bool { unsafe {
-    (*self.work_group).worker_set.set_as_occupied(self.index)
-  } }
   fn mark_as_free(&self) -> bool {
     unsafe{(*self.work_group).worker_set.set_as_free(self.index)}
   }
@@ -537,10 +532,9 @@ impl Worker {
   }
   fn start(&mut self) { unsafe {
     let init_bit = WorkerFlags::FIRST_INIT_BIT;
-    let prior = self.flags.0.fetch_or(init_bit, Ordering::AcqRel);
+    let prior = self.flags.0.fetch_or(init_bit, Ordering::Relaxed);
     let already_initialised = prior & init_bit != 0 ;
     if already_initialised { return }
-    let _ = self.mark_as_occupied();
     if let None = self.runner_handle {
       let copy = transmute_copy::<_, u64>(&self);
       let thread = thread::spawn(move ||{
@@ -624,7 +618,7 @@ impl FailablePageSource for RetiredPageAggregator {
       self.try_get_page()
   }
 }
-#[repr(C)] #[repr(align(256))]
+#[repr(C)]
 union TaskPack {
   items: std::mem::ManuallyDrop<[Task ; 16]>,
   simd: Simd<u64, 32>
@@ -645,7 +639,7 @@ impl TaskCombiner {
       return None
     }
     let item = unsafe {self.data.last_mut().unwrap().simd};
-    return Some((item, self.subindex - 1));
+    return Some((item, self.subindex));
   }
   fn push(&mut self, task: Task) { unsafe {
     if self.subindex == 16 || self.data.is_empty() {
@@ -659,11 +653,12 @@ impl TaskCombiner {
   fn drop_last(&mut self) {
     if self.len == 0 { return }
     self.len -= self.subindex as usize;
-    if let Some(_) = self.data.pop() {
-      self.subindex = 16;
-    } else {
+    let _ = self.data.pop();
+    if self.data.is_empty() {
       self.subindex = 0;
-    };
+    } else {
+      self.subindex = 16;
+    }
   }
   fn len(&self) -> usize {
     self.len
@@ -735,21 +730,21 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
         }
         if let Some((pack, count)) = (*workset_).deque_pack() {
           exported_context.workset.inline_tasks.insert_pack(pack, count as _);
-          exec_state = ExecState::Execute;
+          exec_state = ExecState::Fetch;
           continue 'dispatch;
         }
         exec_state = ExecState::Sleep;
         continue 'dispatch;
       },
       ExecState::Sleep => {
-        let all_idle = worker.mark_as_free();
-        let rc = &(*(*worker.work_group).worker_set.0.get()).liveness_count;
-        let outcome = rc.compare_exchange(0, 0, Ordering::Relaxed, Ordering::Relaxed);
-        let should_terminate_self = all_idle && outcome.is_ok();
-        if should_terminate_self {
-          // release resources
-          return;
-        }
+        let _ = worker.mark_as_free();
+        // let rc = &(*(*worker.work_group).worker_set.0.get()).liveness_count;
+        // let outcome = rc.compare_exchange(0, 0, Ordering::Relaxed, Ordering::Relaxed);
+        // let should_terminate_self = all_idle && outcome.is_ok();
+        // if should_terminate_self {
+        //   // release resources
+        //   return;
+        // }
         //
         loop {
           if worker.flags.has_transaction_began() {
@@ -781,7 +776,7 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
                 frame.subtask_count.store(
                   immidiate_state.spawned_subtask_count as u32, Ordering::Relaxed);
                 frame.continuation = next;
-                schedule_work(worker_set, &mut*workset_);
+                share_work(worker_set, &mut*workset_);
                 task_context.clear_dirty_state();
                 exec_state = ExecState::Fetch;
                 continue 'dispatch;
@@ -805,8 +800,9 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
                 Supertask::Parent(parked_task_ref) => {
                   let parent_task = parked_task_ref.bitcopy();
                   let parent_frame = parent_task.deref_mut();
+                  fence(Ordering::Release);
                   let remaining_subtasks_count =
-                    parent_frame.subtask_count.fetch_sub(1, Ordering::Release);
+                    parent_frame.subtask_count.fetch_sub(1, Ordering::Relaxed);
                   let last_child = remaining_subtasks_count == 1;
                   if last_child {
                     fence(Ordering::Acquire);
@@ -858,7 +854,7 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
 
 } }
 
-fn schedule_work(
+fn share_work(
   worker_set: &mut WorkerSet,
   workset: *mut TaskSet,
 ) { unsafe {
@@ -874,10 +870,8 @@ fn schedule_work(
           let maybe_free_worker = worker_set.try_acquire_free_worker_mref();
           match maybe_free_worker {
             Some(subordinate_worker) => {
-              if !subordinate_worker.flags.was_started() {
-                subordinate_worker.start()
-              }
               ws.outline_tasks.drop_last();
+              subordinate_worker.start();
               subordinate_worker.with_synced_access(|subordinate_worker|{
                 let subordinates_inner_ctx =
                   &mut (*subordinate_worker.inner_context_ptr.assume_init());
@@ -1261,18 +1255,21 @@ impl WorkGroup {
     return WorkGroupRef(boxed)
   } }
   pub fn destroy(&self) { unsafe {
-    let work_set = &self.worker_set;
-    let io_worker = &mut (*work_set.0.get()).io_thread;
+    let workeset = &mut *self.worker_set.0.get();
+    while workeset.inline_free_indicies.compare_exchange(
+      0, 0, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        yield_now()
+    }
+    let io_worker = &mut workeset.io_thread;
     while io_worker.went_to_sleep.compare_exchange(
       true, true, Ordering::Relaxed, Ordering::Relaxed).is_err() { yield_now() }
-
     io_worker.have_to_die.store(true, Ordering::Relaxed);
     io_worker.wakeup();
     io_worker.handle.take().unwrap().join().unwrap();
-    let total_worker_count = work_set.total_worker_count();
+    let total_worker_count = workeset.total_worker_count;
     for ix in 0 .. total_worker_count {
-      let wref = work_set.mref_worker_at_index(ix);
-      if wref.flags.is_initialised() {
+      let wref = self.worker_set.mref_worker_at_index(ix);
+      if wref.flags.was_started() {
         wref.flags.mark_for_termination();
         wref.wakeup();
         wref.runner_handle.take().unwrap().join().unwrap()
@@ -1288,9 +1285,7 @@ impl WorkGroupRef {
         break worker
       };
     };
-    if !worker.flags.was_started() {
-      worker.start();
-    }
+    worker.start();
     let can_resume = AtomicBool::new(false);
     let requesting_thread = current();
     worker.with_synced_access(|worker|{
@@ -1316,6 +1311,7 @@ impl WorkGroupRef {
     });
     forget(capture);
     loop {
+
       park();
       if can_resume.load(Ordering::Relaxed) { break }
     }
@@ -1327,9 +1323,7 @@ impl WorkGroupRef {
         break worker
       };
     };
-    if !worker.flags.was_started() {
-      worker.start();
-    }
+    worker.start();
     worker.with_synced_access(|worker|{
       let inner_ctx = &mut *worker.inner_context_ptr.assume_init();
       let mut infailable_page_source = PageRouter(||{
@@ -1517,7 +1511,7 @@ fn mem_locations() { unsafe {
 
 #[test]
 fn race_on_trivial1() {
-  let wg = WorkGroup::new_with_thread_count(1).unwrap();
+  let wg = WorkGroup::new_with_thread_count(6).unwrap();
   let counter = AtomicU64::new(0);
   const LIMIT : u64 = 1_000_000 ;
   wg.submit_and_await(&counter, |ctx| {
