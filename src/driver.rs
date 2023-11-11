@@ -206,7 +206,7 @@ impl SubRegionAllocator {
       let mtd_ptr = tail.byte_add(tail.align_offset(align_of::<TaskFrame>()));
       let data_ptr_unal = mtd_ptr.byte_add(size_of::<TaskFrame>());
       let data_ptr_al = data_ptr_unal.byte_add(data_ptr_unal.align_offset(env_align));
-      let data_is_overaligned = data_ptr_al != data_ptr_al;
+      let data_is_overaligned = data_ptr_al != data_ptr_unal;
       let mtd_ptr = if data_is_overaligned {
         let ptr = data_ptr_al.byte_sub(size_of::<TaskFrame>());
         assert!(ptr.expose_addr() >= mtd_ptr.expose_addr());
@@ -1104,14 +1104,14 @@ impl Continuation {
 }
 type Thunk = fn (&TaskContext) -> Continuation;
 
-
+#[derive(Debug)]
 enum Supertask {
   Thread(Thread, *const AtomicBool),
   Parent(TaskFrameRef),
   None
 }
 
-#[repr(C)]
+#[repr(C)] #[derive(Debug)]
 struct TaskFrame {
   dependent_task: Supertask,
   subtask_count: AtomicU32,
@@ -1472,8 +1472,13 @@ fn alo_fr() {
   let ra = RootAllocator::new();
   let sr = SubRegionAllocator::new();
   let fr = sr.alloc_task_frame(
-    1, 0, &mut || ra.try_get_page_blocking()).unwrap();
+    128, 1, &mut || ra.try_get_page_blocking()).unwrap();
   let frame = fr.get_frame_ptr();
   let data = fr.get_data_ptr();
-  println!("{:#?} {:#?} {:#?}", data, frame, unsafe{&*sr.0.get()})
+  println!("{:#?} {:#?} {:#?}", data, frame, unsafe{&*sr.0.get()});
+  unsafe { frame.write(TaskFrame {
+      dependent_task: Supertask::None,
+      subtask_count: AtomicU32::new(1),
+      continuation: Continuation { continuation: ContinuationRepr::Done } }) }
+  println!("{:?}", unsafe { &*frame });
 }
