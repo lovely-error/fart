@@ -5,7 +5,7 @@ use crate::root_alloc::Block4KPtr;
 #[macro_export]
 macro_rules! ensure {
     ($cond:expr) => {
-      const _ : () = if !$cond { panic!("static check failed") } else { () } ;
+      const _ : () = if !$cond { panic!("static check failed") } ;
     };
 }
 

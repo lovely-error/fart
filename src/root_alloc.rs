@@ -1,5 +1,5 @@
 
-use core::sync::atomic::AtomicUsize;
+use core::{sync::atomic::AtomicUsize, alloc::GlobalAlloc};
 use std::{alloc::{alloc, Layout}, sync::atomic::{AtomicU16, Ordering, fence}, cell::UnsafeCell, thread, ptr::{null_mut, addr_of, slice_from_raw_parts}, mem::size_of};
 
 use crate::{cast, utils::InfailablePageSource};
@@ -11,11 +11,12 @@ const PAGE_2MB_SIZE: usize = 1 << 21;
 const PAGE_2MB_ALIGN: usize = 1 << 21;
 const SMALL_PAGE_LIMIT: usize = PAGE_2MB_SIZE / 4096;
 
-pub struct RootAllocator {
-  super_page_start: UnsafeCell<*mut [u8;4096]>,
+pub struct RootAllocator(UnsafeCell<RootAllocatorInner>);
+struct RootAllocatorInner {
+  super_page_start: *mut [u8;4096],
   index: AtomicUsize,
 }
-
+unsafe impl Sync for RootAllocator {}
 impl RootAllocator {
   fn alloc_superpage() -> Option<*mut u8> { unsafe {
     let mut mem = libc::mmap64(
@@ -35,20 +36,23 @@ impl RootAllocator {
     return Some(mem.cast())
   } }
   pub fn new() -> Self {
-    Self {
-      super_page_start: UnsafeCell::new(null_mut()),
-      index: AtomicUsize::new(SMALL_PAGE_LIMIT << 1)
-    }
+    Self(
+      UnsafeCell::new(RootAllocatorInner {
+        super_page_start: null_mut(),
+        index: AtomicUsize::new(SMALL_PAGE_LIMIT << 1)
+      })
+    )
   }
   #[inline(never)]
   pub fn try_get_page_nonblocking(&self) -> Option<Block4KPtr> {
-    let offset = self.index.fetch_add(1 << 1, Ordering::Relaxed);
+    let this = unsafe{&mut*self.0.get()};
+    let offset = this.index.fetch_add(1 << 1, Ordering::Relaxed);
     let locked = offset & 1 == 1;
     if locked { return None }
     let mut index = offset >> 1;
     let did_overshoot = index >= SMALL_PAGE_LIMIT;
     if did_overshoot {
-      let item = self.index.fetch_or(1, Ordering::Relaxed);
+      let item = this.index.fetch_or(1, Ordering::Relaxed);
       let already_locked = item & 1 == 1;
       if already_locked {
         errno::set_errno(errno::Errno(libc::EWOULDBLOCK));
@@ -56,13 +60,13 @@ impl RootAllocator {
       }
       else { // we gotta provide new page
         let page = Self::alloc_superpage()?;
-        unsafe { *self.super_page_start.get() = page.cast() };
-        self.index.store(1 << 1, Ordering::Release);
+        this.super_page_start = page.cast();
+        this.index.store(1 << 1, Ordering::Release);
         index = 0;
       }
     };
     fence(Ordering::Acquire); // we must see that page got allocated
-    let ptr = unsafe { (*self.super_page_start.get()).add(index) };
+    let ptr = unsafe { this.super_page_start.add(index) };
     return Some(Block4KPtr(ptr.cast()));
   }
   pub fn try_get_page_blocking(&self) -> Option<Block4KPtr> {
@@ -79,7 +83,7 @@ impl RootAllocator {
     }
   }
 }
-pub struct Block4KPtr(*mut ());
+pub struct Block4KPtr(*mut u8);
 impl Block4KPtr {
   pub fn new(ptr: *mut ()) -> Self {
     assert!(ptr.is_aligned_to(4096), "misaligned ptr given to Block4KPtr");
@@ -89,10 +93,6 @@ impl Block4KPtr {
     self.0 as _
   }
 }
-
-// unsafe impl Send for RootAllocator {}
-unsafe impl Sync for RootAllocator {}
-
 
 #[test]
 fn alloc_works() {

@@ -29,7 +29,7 @@ use core_affinity;
 
 const SMALL_PAGE_SIZE : usize = 4096;
 
-struct RegionMetadata {
+pub(crate) struct RegionMetadata {
   ref_count: AtomicU16
 }
 #[repr(C)] #[repr(align(4096))]
@@ -42,29 +42,32 @@ ensure!(size_of::<Page>() == SMALL_PAGE_SIZE);
 static mut DEALLOCATION_COUNT : AtomicU64 = AtomicU64::new(0);
 static mut ALLOCATION_COUNT : AtomicU64 = AtomicU64::new(0);
 
+#[derive(Debug)]
 enum AllocatorStateTag {
   Uninit,
   Operational,
   Poisoned
 }
+#[derive(Debug)]
 struct AllocatorStateData {
   current_page_start: *mut Page,
   allocation_tail: *mut u8,
 }
+#[derive(Debug)]
 struct SubRegionAllocatorInner {
-  tag: AllocatorStateTag,
   data: AllocatorStateData
 }
+#[derive(Debug)]
 pub struct SubRegionAllocator(UnsafeCell<SubRegionAllocatorInner>);
 impl SubRegionAllocator {
   pub fn new() -> Self {
     Self(UnsafeCell::new(SubRegionAllocatorInner {
-      tag: AllocatorStateTag::Uninit,
       data: AllocatorStateData { current_page_start: null_mut(), allocation_tail: null_mut() }
     }))
   }
   fn set_new_page(&self, block:Block4KPtr) { unsafe {
-    let new_page_ptr = block.get_data_ptr().cast::<Page>();
+    let mem_ptr = block.get_data_ptr();
+    let new_page_ptr = mem_ptr.cast::<Page>();
     {
       let ptr = &mut *new_page_ptr;
       // this has to be born with ref count +1 to not allow for
@@ -74,7 +77,7 @@ impl SubRegionAllocator {
     };
     let this = &mut*self.0.get();
     this.data.current_page_start = new_page_ptr;
-    this.data.allocation_tail = new_page_ptr.cast::<u8>().byte_add(size_of::<RegionMetadata>());
+    this.data.allocation_tail = mem_ptr.cast::<u8>().byte_add(size_of::<RegionMetadata>());
   } }
   // true if still needs page
   fn release_page(
@@ -97,6 +100,7 @@ impl SubRegionAllocator {
       return true;
     }
   } }
+  #[inline(never)]
   pub fn alloc_bytes(
     &self,
     byte_size: usize,
@@ -114,65 +118,53 @@ impl SubRegionAllocator {
       return None;
     }
     let this = &mut*self.0.get();
-    loop {
-    match this.tag {
-      AllocatorStateTag::Uninit => {
-        let smth = free_page_provider();
-        if smth.is_none() { return None; }
-        self.set_new_page(smth.unwrap());
-        this.tag = AllocatorStateTag::Operational;
-        continue;
-      },
-      AllocatorStateTag::Poisoned => {
-        let needs_page = self.release_page();
+    if this.data.current_page_start.is_null() {
+      let smth = free_page_provider();
+      if smth.is_none() { return None; }
+      self.set_new_page(smth.unwrap());
+    }
+    let addr = this.data.allocation_tail.expose_addr();
+    if addr == addr & !(SMALL_PAGE_SIZE - 1) {
+      let needs_page = self.release_page();
         if needs_page {
           let smth = free_page_provider();
           if smth.is_none() { return None; }
           self.set_new_page(smth.unwrap());
         }
-        this.tag = AllocatorStateTag::Operational;
-        continue;
-      },
-      AllocatorStateTag::Operational => {
-        'attempt:loop {
-          let mut ptr = this.data.allocation_tail;
-          ptr = ptr.byte_add(ptr.align_offset(alignment));
-          let next_allocation_tail = ptr.byte_add(byte_size);
-          let region_end_addr =
-            this.data.current_page_start.expose_addr() + SMALL_PAGE_SIZE;
-          let next_alloc_addr = next_allocation_tail.expose_addr();
-          let doesnt_fit = next_alloc_addr > region_end_addr;
-          if doesnt_fit {
-            // here we need to release current page (effectively detaching it from this worker)
-            // and making current page amenable for consumption by last user of some object,
-            // residing within the region backed by current page.
-            // all regions have owning worker until they become full, at which point they
-            // have to be detached and recycled by last user (worker)
-            let need_repage = self.release_page();
-            if need_repage {
-              let smth = free_page_provider();
-              if smth.is_none() { return None; }
-              self.set_new_page(smth.unwrap());
-              continue 'attempt;
-            }
-          }
-          let _ = (*this.data.current_page_start)
-            .metadata.ref_count.fetch_add(1, Ordering::AcqRel);
-
-          this.data.allocation_tail = next_allocation_tail;
-          if next_alloc_addr == region_end_addr {
-            this.tag = AllocatorStateTag::Poisoned;
-          }
-
-          return Some(OpaqueRegionItemRef::new(ptr.cast()));
+    }
+    'attempt:loop {
+      let mut ptr = this.data.allocation_tail;
+      ptr = ptr.byte_add(ptr.align_offset(alignment));
+      let next_allocation_tail = ptr.byte_add(byte_size);
+      let region_end_addr =
+        this.data.current_page_start.expose_addr() + SMALL_PAGE_SIZE;
+      let next_alloc_addr = next_allocation_tail.expose_addr();
+      let doesnt_fit = next_alloc_addr > region_end_addr;
+      if doesnt_fit {
+        // here we need to release current page (effectively detaching it from this worker)
+        // and making current page amenable for consumption by last user of some object,
+        // residing within the region backed by current page.
+        // all regions have owning worker until they become full, at which point they
+        // have to be detached and recycled by last user (worker)
+        let need_repage = self.release_page();
+        if need_repage {
+          let smth = free_page_provider();
+          if smth.is_none() { return None; }
+          self.set_new_page(smth.unwrap());
+          continue 'attempt;
         }
-      },
-    } }
+      }
+      let _ = (*this.data.current_page_start)
+        .metadata.ref_count.fetch_add(1, Ordering::Relaxed);
+
+      this.data.allocation_tail = next_allocation_tail;
+
+      return Some(OpaqueRegionItemRef::new(ptr.cast()));
+    }
   }; }
-  #[track_caller]
-  pub fn dispose(&mut self, object: OpaqueRegionItemRef) -> Option<Block4KPtr>{ unsafe {
+  pub fn dispose<T: RegionPtrObject>(&self, object: T) -> Option<Block4KPtr>{ unsafe {
     DEALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-    let rptr = object.get_region_origin_ptr();
+    let rptr = object.get_region_metadata_ptr();
     let i = (*rptr).ref_count.fetch_sub(1, Ordering::Release) ;
     if i == 1 {
       fence(Ordering::Acquire);
@@ -180,29 +172,79 @@ impl SubRegionAllocator {
     }
     return None
   } }
+  #[inline(never)]
   fn alloc_task_frame(
-    &mut self,
+    &self,
     env_align: usize,
     env_size: usize,
-    page_source:&mut dyn InfailablePageSource
-  ) -> UninitRegionPtr<TaskFrame> {
-    let header_size = size_of::<TaskFrame>() ;
-    let data_loc = header_size.next_multiple_of(env_align);
-    let total_size = data_loc + env_size;
-
-    let frame_allocation_limit = SMALL_PAGE_SIZE - size_of::<RegionMetadata>();
-    if total_size > frame_allocation_limit {
-      panic!("Cant allocate this much for single object. Use indirection")
+    free_page_provider:&mut dyn FnMut() -> Option<Block4KPtr>
+  ) -> Option<TaskFrameRef> { unsafe {
+    let frame_size = size_of::<RegionMetadata>().next_multiple_of(env_align) + env_size;
+    if frame_size >= SMALL_PAGE_SIZE {
+      // cant reasonably handle this yet
+      errno::set_errno(errno::Errno(libc::EINVAL));
+      return None;
     }
-    let region_ref = self.alloc_bytes(
-      total_size, align_of::<TaskFrame>(), &mut || Some(page_source.get_page()));
+    let this = &mut*self.0.get();
+    if this.data.current_page_start.is_null() {
+      let smth = free_page_provider();
+      if smth.is_none() { return None; }
+      self.set_new_page(smth.unwrap());
+    }
+    let addr = this.data.allocation_tail.expose_addr();
+    if addr == addr & !(SMALL_PAGE_SIZE - 1) {
+      let needs_page = self.release_page();
+        if needs_page {
+          let smth = free_page_provider();
+          if smth.is_none() { return None; }
+          self.set_new_page(smth.unwrap());
+        }
+    }
+    'attempt:loop {
+      let tail = this.data.allocation_tail;
+      assert!(tail.expose_addr() != 0);
+      let mtd_ptr = tail.byte_add(tail.align_offset(align_of::<TaskFrame>()));
+      let data_ptr_unal = mtd_ptr.byte_add(size_of::<TaskFrame>());
+      let data_ptr_al = data_ptr_unal.byte_add(data_ptr_unal.align_offset(env_align));
+      let data_is_overaligned = data_ptr_al != data_ptr_al;
+      let mtd_ptr = if data_is_overaligned {
+        let ptr = data_ptr_al.byte_sub(size_of::<TaskFrame>());
+        assert!(ptr.expose_addr() >= mtd_ptr.expose_addr());
+        ptr
+      } else {
+        mtd_ptr
+      };
+      let next_allocation_tail = data_ptr_al.byte_add(env_size);
+      let region_end_addr =
+        this.data.current_page_start.expose_addr() + SMALL_PAGE_SIZE;
+      let next_alloc_addr = next_allocation_tail.expose_addr();
+      let doesnt_fit = next_alloc_addr > region_end_addr;
+      if doesnt_fit {
+        // here we need to release current page (effectively detaching it from this worker)
+        // and making current page amenable for consumption by last user of some object,
+        // residing within the region backed by current page.
+        // all regions have owning worker until they become full, at which point they
+        // have to be detached and recycled by last user (worker)
+        let need_repage = self.release_page();
+        if need_repage {
+          let smth = free_page_provider();
+          if smth.is_none() { return None; }
+          self.set_new_page(smth.unwrap());
+          continue 'attempt;
+        }
+      }
+      let _ = (*this.data.current_page_start)
+        .metadata.ref_count.fetch_add(1, Ordering::Relaxed);
 
-    return RegionItemRef(region_ref.unwrap(), PhantomData);
-  }
+      this.data.allocation_tail = next_allocation_tail;
+
+      return Some(TaskFrameRef(mtd_ptr));
+    }
+  } }
 }
 
 pub trait RegionPtrObject {
-  fn destruct(self) -> OpaqueRegionItemRef;
+  fn get_region_metadata_ptr(&self) -> *mut RegionMetadata;
 }
 
 pub type UninitRegionPtr<T> = RegionItemRef<MaybeUninit<T>>;
@@ -230,47 +272,49 @@ impl <T> RegionItemRef<T> {
   }
 }
 impl <T> RegionPtrObject for RegionItemRef<T> {
-  fn destruct(self) -> OpaqueRegionItemRef {
-    self.0
+  fn get_region_metadata_ptr(&self) -> *mut RegionMetadata {
+    self.0.get_region_origin_ptr().cast()
   }
 }
 #[derive(Debug, Clone, Copy)]
-pub struct OpaqueRegionItemRef(u64);
+pub struct OpaqueRegionItemRef(*mut ());
 impl OpaqueRegionItemRef {
+  pub(crate) fn new(ptr: *mut ()) -> Self {
+    Self(ptr)
+  }
   pub fn new_null() -> Self {
-    OpaqueRegionItemRef(0)
+    OpaqueRegionItemRef(null_mut())
   }
   pub fn is_null(&self) -> bool {
-    self.0 == 0
-  }
-  pub fn new(
-    region_segment_addr: *mut (),
-  ) -> Self {
-    Self(region_segment_addr.expose_addr() as u64)
+    self.0.is_null()
   }
   pub fn get_data_ptr(&self) -> *mut () {
     self.0 as _
   }
-  fn get_region_origin_ptr(&self) -> *mut RegionMetadata {
-    (self.0 & !((1 << 12) - 1)) as _
+  pub(crate) fn get_region_origin_ptr(&self) -> *mut RegionMetadata {
+    (self.0.expose_addr() & !((1 << 12) - 1)) as _
   }
   pub fn bind_type<T>(self) -> RegionItemRef<T> {
     RegionItemRef(self, PhantomData)
   }
 }
-#[repr(C)]
-struct SyncedMtd {
-  ref_count: AtomicU32,
-  active_readers_count: AtomicU32,
-  align_order: u8,
+#[derive(Debug, Clone, Copy)]
+struct TaskFrameRef(*mut u8);
+impl TaskFrameRef {
+    fn get_data_ptr(&self) -> *mut u8 {
+      unsafe { self.0.byte_add(size_of::<TaskFrame>()).cast() }
+    }
+    fn get_frame_ptr(&self) -> *mut TaskFrame {
+      self.0.cast()
+    }
+    fn get_region_mtd(&self) -> *mut RegionMetadata {
+      self.0.map_addr(|addr| addr & !(SMALL_PAGE_SIZE - 1)).cast()
+    }
 }
-impl SyncedMtd {
-  fn ptr_to_data(&self) -> *mut () { unsafe {
-    let align = 1 << self.align_order;
-    let ptr = transmute::<_, *mut ()>(self).byte_add(size_of::<Self>());
-    let ptr = ptr.byte_add(ptr.align_offset(align));
-    return ptr
-  } }
+impl RegionPtrObject for TaskFrameRef {
+  fn get_region_metadata_ptr(&self) -> *mut RegionMetadata {
+      self.get_region_mtd()
+  }
 }
 
 
@@ -339,7 +383,15 @@ fn io_polling_routine(this: &mut IOPollingWorker) { unsafe {
       }
     }
     gathered_events.clear();
-    poller.wait(&mut gathered_events, Some(Duration::from_millis(100))).unwrap();
+    let outcome = poller.wait(&mut gathered_events, Some(Duration::from_millis(100)));
+    match outcome {
+      Ok(_) => (),
+      Err(err) => {
+        match err.kind() {
+            _ => (), // whatever
+        }
+      }
+    }
     let no_continuations_to_resume = gathered_events.is_empty();
     if no_continuations_to_resume && pending_tasks.is_empty() {
       let _ =
@@ -753,10 +805,12 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
   while !worker.flags.is_first_work_submited() {}
   fence(Ordering::Acquire);
 
+  let mut current_task : Task = Task::new_null();
+
   let workset_ = addr_of_mut!(exported_context.workset);
   let mut immidiate_state = ImmidiateState {
     spawned_subtask_count: 0,
-    current_task: MaybeUninit::uninit()
+    current_task: addr_of!(current_task)
   };
   let mut infailable_page_source = PageRouter_([
     &mut drainer
@@ -773,8 +827,8 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
     match exec_state {
       ExecState::Fetch => {
         share_work(worker_set, &mut*workset_);
-        if let Some(task) = (*workset_).deque_one() {
-          immidiate_state.current_task.write(task);
+        if let Some(new_task) = (*workset_).deque_one() {
+          current_task = new_task;
           exec_state = ExecState::Execute;
           continue 'dispatch;
         }
@@ -805,7 +859,8 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
         continue 'dispatch;
       },
       ExecState::Execute => {
-        let mut continuation = immidiate_state.current_task.assume_init_mut().task_frame_ptr.deref_mut().continuation.continuation;
+        let frame = &mut*current_task.task_frame_ptr.get_frame_ptr();
+        let mut continuation = frame.continuation.continuation;
         'fast_path: loop {
           match continuation {
             ContinuationRepr::Then(thunk) => {
@@ -813,9 +868,6 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
               fence(Ordering::Release);
               let produced_subtasks = immidiate_state.spawned_subtask_count != 0;
               if produced_subtasks {
-                let current_task = immidiate_state.current_task.assume_init_read();
-                let frame = current_task.task_frame_ptr.deref_mut();
-                frame.resume_task_meta.write(current_task.metadata);
                 frame.subtask_count.store(
                   immidiate_state.spawned_subtask_count as u32, Ordering::Relaxed);
                 frame.continuation = next;
@@ -828,53 +880,44 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
               }
             },
             ContinuationRepr::Done => {
-              let current_task = immidiate_state.current_task.assume_init_mut();
-              let current_task_frame = current_task.task_frame_ptr.deref();
-              match &current_task_frame.dependent_task {
+              match &frame.dependent_task {
                 Supertask::Thread(awaiting_thread, flag) => {
                   (**flag).store(true, Ordering::Relaxed);
                   awaiting_thread.unpark();
-                  exported_context.allocator.dispose(
-                    immidiate_state.current_task.assume_init_read().task_frame_ptr.0);
+                  exported_context.allocator.dispose(current_task.task_frame_ptr);
                   exec_state = ExecState::Fetch;
                   continue 'dispatch;
                 },
-                Supertask::Parent(parked_task_ref) => {
-                  let parent_task = parked_task_ref.bitcopy();
-                  let parent_frame = parent_task.deref_mut();
+                Supertask::Parent(parked_task) => {
+                  let parked_task = *parked_task;
+                  let parent_frame = parked_task.get_frame_ptr();
                   let remaining_subtasks_count =
-                    parent_frame.subtask_count.fetch_sub(1, Ordering::Relaxed);
+                    (*parent_frame).subtask_count.fetch_sub(1, Ordering::Relaxed);
                   let last_child = remaining_subtasks_count == 1;
                   if last_child {
                     fence(Ordering::Acquire);
-                    exported_context.allocator.dispose(current_task.task_frame_ptr.0);
-                    let parent_meta = parent_frame.resume_task_meta.assume_init_read();
-                    current_task.metadata = parent_meta;
-                    continuation = parent_frame.continuation.continuation;
-                    current_task.task_frame_ptr = parent_task;
-                    continue 'fast_path;
+                    exported_context.allocator.dispose(current_task.task_frame_ptr);
+                    current_task.task_frame_ptr = parked_task;
+                    continue 'dispatch;
                   } else {
-                    exported_context.allocator.dispose(
-                      immidiate_state.current_task.assume_init_read().task_frame_ptr.0);
+                    exported_context.allocator.dispose(current_task.task_frame_ptr);
                     exec_state = ExecState::Fetch;
                     continue 'dispatch;
                   }
                 },
                 Supertask::None => {
-                  exported_context.allocator.dispose(
-                    immidiate_state.current_task.assume_init_read().task_frame_ptr.0);
+                  exported_context.allocator.dispose(current_task.task_frame_ptr);
                   exec_state = ExecState::Fetch;
                   continue 'dispatch;
                 },
               }
             },
             ContinuationRepr::AwaitIO(fd, r, w, next) => {
-              immidiate_state.current_task.assume_init_mut()
-              .task_frame_ptr.deref_mut().continuation = Continuation {
+              (*current_task.task_frame_ptr.get_frame_ptr()).continuation = Continuation {
                 continuation: ContinuationRepr::Then(next)
               };
               let item = IOPollingCallbackData {
-                task_to_resume: immidiate_state.current_task.assume_init_read(),
+                task_to_resume: current_task,
                 target: fd, readable: r, writeable: w
               };
               worker.io_tasks_sink.send(item).unwrap();
@@ -931,7 +974,7 @@ fn share_work(
 } }
 
 struct ImmidiateState {
-  current_task: MaybeUninit<Task>,
+  current_task: *const Task,
   spawned_subtask_count: u32,
 }
 pub struct TaskContext(UnsafeCell<TaskContextInternals>);
@@ -961,9 +1004,8 @@ impl TaskContext {
   }
   pub fn acccess_frame_as_raw(&self) -> *mut () { unsafe {
     let this = &mut *self.0.get();
-    let task = &mut (*this.immidiate_state).current_task;
-    let data_offset = task.assume_init_mut().raw_ptr_to_data();
-    return data_offset.cast();
+    let data_ptr = (*(*this.immidiate_state).current_task).task_frame_ptr.get_data_ptr();
+    return data_ptr.cast();
   } }
   pub fn access_frame_as_uninit<T>(&self) -> &mut MaybeUninit<T> { unsafe {
     return &mut *self.acccess_frame_as_raw().cast::<MaybeUninit<T>>()
@@ -1007,24 +1049,21 @@ impl TaskContext {
     }
 
     let frame_ref = (*this.worker_inner_context_ref).allocator.alloc_task_frame(
-      env_align, env_size, &mut*this.infailable_page_source);
-    let frame_ref = frame_ref.init(TaskFrame {
+      env_align, env_size, &mut || Some((*this.infailable_page_source).get_page())).unwrap();
+    let mtd_ptr = frame_ref.get_frame_ptr();
+    mtd_ptr.write(TaskFrame {
       dependent_task: if !detached {
-        let parent_frame: RegionItemRef<TaskFrame> =
-          immidiate_state_ref.current_task.assume_init_ref().task_frame_ptr.bitcopy();
-        Supertask::Parent(parent_frame)
+        Supertask::Parent((*immidiate_state_ref.current_task).task_frame_ptr)
       } else {
         Supertask::None
       },
-      resume_task_meta: MaybeUninit::uninit(),
       subtask_count: AtomicU32::new(0),
       continuation: Continuation { continuation: ContinuationRepr::Then(thunk) }
     });
-    let data_ptr = frame_ref.deref_raw().cast::<u8>().byte_add(size_of::<TaskFrame>());
-    let data_ptr = data_ptr.byte_add(data_ptr.align_offset(env_align));
+    let data_ptr = frame_ref.get_data_ptr();
     copy_nonoverlapping(env_data.cast::<u8>(), data_ptr.cast::<u8>(), env_size);
 
-    let subtask = Task::new(TaskMetadata { data_align: env_align as u16 }, frame_ref);
+    let subtask = Task::new(frame_ref);
     let task_set = &mut (*this.worker_inner_context_ref).workset;
     task_set.enque(subtask, &mut*this.infailable_page_source);
   }; }
@@ -1035,11 +1074,11 @@ impl TaskContext {
   }
 }
 
-
+#[derive(Debug)]
 pub struct Continuation {
   continuation: ContinuationRepr
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum ContinuationRepr {
   Done,
   Then(Thunk),
@@ -1068,7 +1107,7 @@ type Thunk = fn (&TaskContext) -> Continuation;
 
 enum Supertask {
   Thread(Thread, *const AtomicBool),
-  Parent(RegionItemRef<TaskFrame>),
+  Parent(TaskFrameRef),
   None
 }
 
@@ -1076,33 +1115,25 @@ enum Supertask {
 struct TaskFrame {
   dependent_task: Supertask,
   subtask_count: AtomicU32,
-  resume_task_meta: MaybeUninit<TaskMetadata>,
   continuation: Continuation
 }
 
-#[repr(C)] #[repr(align(8))]
-struct TaskMetadata {
-  data_align: u16
-}
-#[repr(C)] #[repr(align(8))]
+#[repr(C)] #[repr(align(8))] #[derive(Debug, Clone, Copy)]
+struct TaskMetadata(u64);
+#[repr(C)] #[repr(align(8))] #[derive(Debug, Clone, Copy)]
 struct Task {
   metadata: TaskMetadata,
-  task_frame_ptr: RegionItemRef<TaskFrame>
+  task_frame_ptr: TaskFrameRef
 }
 impl Task {
   fn new(
-    metadata: TaskMetadata,
-    task_frame_ptr: RegionItemRef<TaskFrame>,
+    task_frame_ptr: TaskFrameRef,
   ) -> Self {
-    Self { metadata, task_frame_ptr }
+    Self { task_frame_ptr, metadata: TaskMetadata(0) }
   }
-  fn raw_ptr_to_data(&self) -> *mut () { unsafe {
-    let align = self.metadata.data_align;
-    let ptr = self.task_frame_ptr.deref_raw().cast::<u8>();
-    let ptr = ptr.byte_add(size_of::<TaskFrame>());
-    let ptr = ptr.byte_add(ptr.align_offset(align as usize));
-    return ptr.cast()
-  } }
+  fn new_null() -> Self {
+    Self { metadata: TaskMetadata(0), task_frame_ptr: TaskFrameRef(null_mut()) }
+  }
 }
 pub struct WorkGroup {
   ralloc: RootAllocator,
@@ -1229,24 +1260,22 @@ impl WorkGroupRef {
         (*inner_ctx.stale_page_drainer.assume_init()).try_drain_page()
         .unwrap_or(worker.get_root_allocator().try_get_page_blocking().unwrap())
       });
-      let frame_ = inner_ctx.allocator.alloc_task_frame(
-        align_of::<Env>(), size_of::<Env>(), &mut infailable_page_source);
-      let inited_frame = frame_.init(TaskFrame {
+      let ptr = inner_ctx.allocator.alloc_task_frame(
+        align_of::<Env>(), size_of::<Env>(), &mut || Some(infailable_page_source.get_page())).unwrap();
+      let frame = ptr.get_frame_ptr();
+      frame.write(TaskFrame {
         dependent_task: Supertask::Thread(requesting_thread, addr_of!(can_resume)),
         subtask_count: AtomicU32::new(0),
-        resume_task_meta: MaybeUninit::uninit(),
         continuation: Continuation { continuation: ContinuationRepr::Then(operation) }
       });
-      let data_ptr = inited_frame.deref_raw().cast::<u8>().byte_add(size_of::<TaskFrame>());
-      let data_ptr = data_ptr.byte_add(data_ptr.align_offset(align_of::<Env>()));
-      copy_nonoverlapping(addr_of!(capture), data_ptr.cast::<Env>(), 1);
+      let data_ptr = ptr.get_data_ptr();
+      copy_nonoverlapping(addr_of!(capture).cast::<u8>(), data_ptr.cast::<u8>(), size_of::<Env>());
 
-      let task = Task::new(TaskMetadata { data_align: align_of::<Env>() as _ },inited_frame);
+      let task = Task::new(ptr);
       inner_ctx.workset.enque(task, &mut infailable_page_source);
     });
     forget(capture);
     loop {
-
       park();
       if can_resume.load(Ordering::Relaxed) { break }
     }
@@ -1265,19 +1294,18 @@ impl WorkGroupRef {
         (*inner_ctx.stale_page_drainer.assume_init()).try_drain_page()
         .unwrap_or(worker.get_root_allocator().try_get_page_blocking().unwrap())
       });
-      let frame_ = inner_ctx.allocator.alloc_task_frame(
-        align_of::<Env>(), size_of::<Env>(), &mut infailable_page_source);
-      let inited_frame = frame_.init(TaskFrame {
+      let ptr = inner_ctx.allocator.alloc_task_frame(
+        align_of::<Env>(), size_of::<Env>(), &mut || Some(infailable_page_source.get_page())).unwrap();
+      let frame = ptr.get_frame_ptr();
+      frame.write(TaskFrame {
         dependent_task: Supertask::None,
         subtask_count: AtomicU32::new(0),
-        resume_task_meta: MaybeUninit::uninit(),
         continuation: Continuation { continuation: ContinuationRepr::Then(operation) }
       });
-      let data_ptr = inited_frame.deref_raw().cast::<u8>().byte_add(size_of::<TaskFrame>());
-      let data_ptr = data_ptr.byte_add(data_ptr.align_offset(align_of::<Env>()));
-      copy_nonoverlapping(addr_of!(capture), data_ptr.cast::<Env>(), 1);
+      let data_ptr = ptr.get_data_ptr();
+      copy_nonoverlapping(addr_of!(capture).cast::<u8>(), data_ptr.cast::<u8>(), size_of::<Env>());
 
-      let task = Task::new(TaskMetadata { data_align: align_of::<Env>() as _ }, inited_frame );
+      let task = Task::new(ptr);
       inner_ctx.workset.enque(task, &mut infailable_page_source);
     });
     forget(capture);
@@ -1313,7 +1341,7 @@ fn test_trivial_tasking() {
 
 
 #[test]
-fn one_shild_one_parent() {
+fn one_child_one_parent() {
 
   static mut NAME: &str = "";
   fn parent(ctx: &TaskContext) -> Continuation {
@@ -1367,82 +1395,6 @@ fn child_child_check_dead() {
     assert!(relc == acqc);
   }
 }
-
-
-
-#[test] #[ignore]
-fn mem_locations() { unsafe {
-  let memer = || {
-    alloc(Layout::from_size_align_unchecked(1 << 21, 4096))
-  };
-  let mut highs = 0;
-  for _ in 0 .. 16 {
-    let mem_addr = memer();
-    let k = ((mem_addr as u64) >> 12) >> 32;
-    if highs == 0 { highs = k } else {
-      assert!(highs == k);
-    }
-  }
-} }
-
-
-// #[test]
-// fn ref_sync() {
-//   const LIMIT : usize = 1000;
-//   struct Ctx {
-//     sync_obj: Option<Isolated<Vec<u32>>>
-//   }
-//   fn begin(ctx: &TaskContext) -> Continuation {
-//     let frame = ctx.access_frame_as_init::<Ctx>();
-//     let smth = ctx.spawn_synced_data(Vec::new());
-//     frame.sync_obj = Some(smth);
-//     for _ in 0 .. LIMIT {
-//       let smth_clone = frame.sync_obj.as_ref().unwrap().clone_ref();
-//       ctx.spawn_subtask(smth_clone, |ctx|{
-//         let frame = ctx.access_frame_as_init::<Isolated<Vec<u32>>>();
-//         return Continuation::sync_mut(frame.clone_ref(), |val, ctx| {
-//           val.push(u32::MAX);
-//           let frame = ctx.access_frame_as_init::<Isolated<Vec<u32>>>();
-//           ctx.dispose_synced_data(frame);
-//           return Continuation::done();
-//         });
-//       });
-//     }
-//     return Continuation::then(sync_on_vec);
-//   }
-//   fn sync_on_vec(ctx: &TaskContext) -> Continuation {
-//     let frame = ctx.access_frame_as_init::<Ctx>();
-//     let obj = frame.sync_obj.as_ref().unwrap().clone_ref();
-//     return Continuation::sync_ref(obj, |val, _| {
-//       let len = val.len();
-//       if len == LIMIT { return Continuation::then(end) }
-//       return Continuation::then(sync_on_vec);
-//     })
-//   }
-//   fn end(ctx: &TaskContext) -> Continuation {
-//     let frame = ctx.access_frame_as_init::<Ctx>();
-//     let obj = frame.sync_obj.as_ref().unwrap().clone_ref();
-//     return Continuation::sync_ref(obj, |val, ctx|{
-//       for i in val {
-//         assert!(*i == u32::MAX)
-//       }
-//       let frame = ctx.access_frame_as_init::<Ctx>();
-//       let vec = frame.sync_obj.take().unwrap();
-//       ctx.dispose_synced_data(vec);
-//       return Continuation::done()
-//     });
-//   }
-
-//   let exec = WorkGroup::new();
-//   exec.submit_and_await(Ctx{sync_obj:None}, begin);
-
-//   unsafe {
-//     let relc = ALLOCATION_COUNT.load(Ordering::Relaxed);
-//     let acqc = DEALLOCATION_COUNT.load(Ordering::Relaxed);
-//     // println!("{} {}", acqc, relc);
-//     assert!(relc == acqc);
-//   }
-// }
 
 #[test]
 fn heavy_spawning() {
@@ -1513,4 +1465,15 @@ fn subsyncing() {
         return Continuation::done();
       })
   });
+}
+
+#[test] #[ignore]
+fn alo_fr() {
+  let ra = RootAllocator::new();
+  let sr = SubRegionAllocator::new();
+  let fr = sr.alloc_task_frame(
+    1, 0, &mut || ra.try_get_page_blocking()).unwrap();
+  let frame = fr.get_frame_ptr();
+  let data = fr.get_data_ptr();
+  println!("{:#?} {:#?} {:#?}", data, frame, unsafe{&*sr.0.get()})
 }
