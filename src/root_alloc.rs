@@ -89,7 +89,7 @@ impl Block4KPtr {
     assert!(ptr.is_aligned_to(4096), "misaligned ptr given to Block4KPtr");
     return Self(ptr.cast())
   }
-  pub fn get_data_ptr(&self) -> *mut u8 {
+  pub fn get_ptr(&self) -> *mut u8 {
     self.0 as _
   }
 }

@@ -20,6 +20,7 @@ pub struct Array<T>(
   UnsafeCell<ArrayInternals>,
   PhantomData<T>);
 
+#[allow(unused)]
 impl <T> Array<T> {
   pub fn new() -> Self {
     Self(UnsafeCell::new(ArrayInternals::new()), PhantomData)
@@ -67,6 +68,7 @@ struct ArrayInternals {
   item_count: usize,
 }
 impl ArrayInternals {
+  #[allow(unused)]
   fn new() -> Self {
     Self { head_page: null_mut(),
            tail_page: null_mut(),
@@ -80,7 +82,7 @@ impl ArrayInternals {
   fn do_late_init(&mut self, item_size: usize, page_source: &mut dyn InfailablePageSource) { unsafe {
     assert!(self.head_page == null_mut());
     let page = page_source.get_page();
-    let ptr = page.get_data_ptr();
+    let ptr = page.get_ptr();
     self.head_page = ptr;
     self.tail_page = ptr;
     let mtd = &mut *ptr.cast::<PageMetadata>();
@@ -90,7 +92,7 @@ impl ArrayInternals {
   } }
   fn expand_storage(&mut self, item_size: usize, page_source: &mut dyn InfailablePageSource) { unsafe {
     let page = page_source.get_page();
-    let ptr = page.get_data_ptr();
+    let ptr = page.get_ptr();
     let mtd = &mut *ptr.cast::<PageMetadata>();
     *mtd = PageMetadata {next_page:null_mut(), previous_page:self.tail_page};
     (&mut *self.tail_page.cast::<PageMetadata>()).next_page = ptr;
@@ -120,6 +122,7 @@ impl <'k,T> ProjectableInternals<'k> for Array<T>  {
 }
 
 #[inline(never)]
+#[allow(non_snake_case, unused)]
 fn Array_ref_item_at_index_impl(
   object: &mut ArrayInternals,
   item_size: usize,
@@ -142,6 +145,7 @@ fn Array_ref_item_at_index_impl(
   return ptr;
 }; }
 #[inline(never)]
+#[allow(non_snake_case, unused)]
 fn Array_push_impl(
   object: &mut ArrayInternals,
   new_item_source_loc: *const u8,
@@ -169,6 +173,7 @@ fn Array_push_impl(
 } }
 
 #[inline(never)]
+#[allow(non_snake_case, unused)]
 fn Array_pop_impl(
   object: &mut ArrayInternals,
   item_size: usize,
@@ -304,7 +309,7 @@ fn draining_works() { unsafe {
   for _ in 0 .. 512 {
     let _ = arr.pop();
   }
-  let ptr = arr.try_drain_page().unwrap().get_data_ptr().cast::<u8>();
+  let ptr = arr.try_drain_page().unwrap().get_ptr().cast::<u8>();
   ptr.write_bytes(u8::MAX, 4096);
   for i in 0 .. 512 {
     arr.push(i, &mut ralloc)
