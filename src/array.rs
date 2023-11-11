@@ -80,7 +80,7 @@ impl ArrayInternals {
   fn do_late_init(&mut self, item_size: usize, page_source: &mut dyn InfailablePageSource) { unsafe {
     assert!(self.head_page == null_mut());
     let page = page_source.get_page();
-    let ptr = page.get_ptr();
+    let ptr = page.get_data_ptr();
     self.head_page = ptr;
     self.tail_page = ptr;
     let mtd = &mut *ptr.cast::<PageMetadata>();
@@ -90,7 +90,7 @@ impl ArrayInternals {
   } }
   fn expand_storage(&mut self, item_size: usize, page_source: &mut dyn InfailablePageSource) { unsafe {
     let page = page_source.get_page();
-    let ptr = page.get_ptr();
+    let ptr = page.get_data_ptr();
     let mtd = &mut *ptr.cast::<PageMetadata>();
     *mtd = PageMetadata {next_page:null_mut(), previous_page:self.tail_page};
     (&mut *self.tail_page.cast::<PageMetadata>()).next_page = ptr;
@@ -304,7 +304,7 @@ fn draining_works() { unsafe {
   for _ in 0 .. 512 {
     let _ = arr.pop();
   }
-  let ptr = arr.try_drain_page().unwrap().get_ptr().cast::<u8>();
+  let ptr = arr.try_drain_page().unwrap().get_data_ptr().cast::<u8>();
   ptr.write_bytes(u8::MAX, 4096);
   for i in 0 .. 512 {
     arr.push(i, &mut ralloc)

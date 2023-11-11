@@ -27,7 +27,7 @@ use crate::{
 
 use core_affinity;
 
-const PAGE_SIZE : usize = 4096;
+const SMALL_PAGE_SIZE : usize = 4096;
 
 struct RegionMetadata {
   ref_count: AtomicU16
@@ -35,26 +35,36 @@ struct RegionMetadata {
 #[repr(C)] #[repr(align(4096))]
 struct Page {
   metadata: RegionMetadata,
-  bytes: MaybeUninit<[u8; PAGE_SIZE - size_of::<RegionMetadata>()]>
+  bytes: MaybeUninit<[u8; SMALL_PAGE_SIZE - size_of::<RegionMetadata>()]>
 }
-ensure!(size_of::<Page>() == PAGE_SIZE);
-
-pub struct SubRegionAllocator {
-  current_page_start: *mut Page,
-  allocation_tail: *mut u8,
-}
+ensure!(size_of::<Page>() == SMALL_PAGE_SIZE);
 
 static mut DEALLOCATION_COUNT : AtomicU64 = AtomicU64::new(0);
 static mut ALLOCATION_COUNT : AtomicU64 = AtomicU64::new(0);
 
-
+enum AllocatorStateTag {
+  Uninit,
+  Operational,
+  Poisoned
+}
+struct AllocatorStateData {
+  current_page_start: *mut Page,
+  allocation_tail: *mut u8,
+}
+struct SubRegionAllocatorInner {
+  tag: AllocatorStateTag,
+  data: AllocatorStateData
+}
+pub struct SubRegionAllocator(UnsafeCell<SubRegionAllocatorInner>);
 impl SubRegionAllocator {
   pub fn new() -> Self {
-    Self { current_page_start: null_mut(),
-           allocation_tail: null_mut(), }
+    Self(UnsafeCell::new(SubRegionAllocatorInner {
+      tag: AllocatorStateTag::Uninit,
+      data: AllocatorStateData { current_page_start: null_mut(), allocation_tail: null_mut() }
+    }))
   }
-  fn set_new_page(&mut self, page_source:&mut dyn InfailablePageSource) { unsafe {
-    let new_page_ptr = page_source.get_page().get_ptr().cast::<Page>();
+  fn set_new_page(&self, block:Block4KPtr) { unsafe {
+    let new_page_ptr = block.get_data_ptr().cast::<Page>();
     {
       let ptr = &mut *new_page_ptr;
       // this has to be born with ref count +1 to not allow for
@@ -62,58 +72,102 @@ impl SubRegionAllocator {
       // consumes this region . this would cause racing
       ptr.metadata.ref_count = AtomicU16::new(1);
     };
-    self.current_page_start = new_page_ptr;
-    self.allocation_tail = new_page_ptr.cast::<u8>().byte_add(size_of::<RegionMetadata>());
+    let this = &mut*self.0.get();
+    this.data.current_page_start = new_page_ptr;
+    this.data.allocation_tail = new_page_ptr.cast::<u8>().byte_add(size_of::<RegionMetadata>());
+  } }
+  // true if still needs page
+  fn release_page(
+    &self,
+  ) -> bool { unsafe {
+    let this = &mut*self.0.get();
+    let prior_count =
+      (*this.data.current_page_start).metadata.ref_count.fetch_sub(1, Ordering::Relaxed);
+    if prior_count == 1 {
+      // extremely rare situation , when we can reuse current page.
+      // there is no need to sync with other threads rws
+      // since we dont use anything they have done .
+      // their writes wont appear out of nowhere.
+      // wont they?
+      fence(Ordering::Acquire);
+      this.data.allocation_tail =
+        this.data.current_page_start.cast::<u8>().byte_add(size_of::<RegionMetadata>());
+      return false;
+    } else {
+      return true;
+    }
   } }
   pub fn alloc_bytes(
-    &mut self,
+    &self,
     byte_size: usize,
     alignment: usize,
-    page_source:&mut dyn InfailablePageSource
-  ) -> OpaqueRegionItemRef { unsafe {
-    ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-
-    assert!(
-      byte_size != 0,
-      "region byte allocator was not made to deal with 0 byte allocations");
+    free_page_provider: &mut dyn FnMut() -> Option<Block4KPtr>
+  ) -> Option<OpaqueRegionItemRef> { unsafe {
+    if byte_size == 0 {
+      errno::set_errno(errno::Errno(libc::EINVAL));
+      return None
+    }
     let reserved_space = size_of::<RegionMetadata>().next_multiple_of(alignment);
-    assert!(
-      PAGE_SIZE - reserved_space >= byte_size,
-      "objects bigger then");
-    if self.current_page_start.is_null() {
-      self.set_new_page(page_source)
+    if byte_size >= SMALL_PAGE_SIZE - reserved_space {
+      // cant reasonably handle this yet
+      errno::set_errno(errno::Errno(libc::EINVAL));
+      return None;
     }
+    let this = &mut*self.0.get();
     loop {
-      let mut ptr = self.allocation_tail;
-      ptr = ptr.byte_add(ptr.align_offset(alignment));
-      let next_allocation_tail = ptr.byte_add(byte_size);
-      let region_end_addr = self.current_page_start.expose_addr() + PAGE_SIZE;
-      let next_alloc_addr = next_allocation_tail.expose_addr();
-      let exceeded_region_capacity = next_alloc_addr >= region_end_addr;
-      if exceeded_region_capacity {
-        // here we need to release current page (effectively detaching it from this worker)
-        // and making current page amenable for consumption by last user of some object,
-        // residing within the region backed by current page.
-        // all regions have owning worker until they become full, at which point they
-        // have to be detached and recycled by last user (worker)
-        let prior_count =
-          (*self.current_page_start).metadata.ref_count.fetch_sub(1, Ordering::Relaxed);
-        if prior_count == 1 { // extremely rare situation , when we can reuse current page
-          fence(Ordering::Acquire); // lets see other uses as happened
-          self.allocation_tail =
-            self.current_page_start.cast::<u8>().byte_add(size_of::<RegionMetadata>());
-          continue;
-        } else {
-          self.set_new_page(page_source);
-          continue;
+    match this.tag {
+      AllocatorStateTag::Uninit => {
+        let smth = free_page_provider();
+        if smth.is_none() { return None; }
+        self.set_new_page(smth.unwrap());
+        this.tag = AllocatorStateTag::Operational;
+        continue;
+      },
+      AllocatorStateTag::Poisoned => {
+        let needs_page = self.release_page();
+        if needs_page {
+          let smth = free_page_provider();
+          if smth.is_none() { return None; }
+          self.set_new_page(smth.unwrap());
         }
-      }
-      let _ = (*self.current_page_start).metadata.ref_count.fetch_add(1, Ordering::AcqRel);
+        this.tag = AllocatorStateTag::Operational;
+        continue;
+      },
+      AllocatorStateTag::Operational => {
+        'attempt:loop {
+          let mut ptr = this.data.allocation_tail;
+          ptr = ptr.byte_add(ptr.align_offset(alignment));
+          let next_allocation_tail = ptr.byte_add(byte_size);
+          let region_end_addr =
+            this.data.current_page_start.expose_addr() + SMALL_PAGE_SIZE;
+          let next_alloc_addr = next_allocation_tail.expose_addr();
+          let doesnt_fit = next_alloc_addr > region_end_addr;
+          if doesnt_fit {
+            // here we need to release current page (effectively detaching it from this worker)
+            // and making current page amenable for consumption by last user of some object,
+            // residing within the region backed by current page.
+            // all regions have owning worker until they become full, at which point they
+            // have to be detached and recycled by last user (worker)
+            let need_repage = self.release_page();
+            if need_repage {
+              let smth = free_page_provider();
+              if smth.is_none() { return None; }
+              self.set_new_page(smth.unwrap());
+              continue 'attempt;
+            }
+          }
+          let _ = (*this.data.current_page_start)
+            .metadata.ref_count.fetch_add(1, Ordering::AcqRel);
 
-      self.allocation_tail = next_allocation_tail;
+          this.data.allocation_tail = next_allocation_tail;
+          if next_alloc_addr == region_end_addr {
+            this.tag = AllocatorStateTag::Poisoned;
+          }
 
-      return OpaqueRegionItemRef::new(ptr.cast());
-    }
+          return Some(OpaqueRegionItemRef::new(ptr.cast()));
+        }
+      },
+    } }
   }; }
   #[track_caller]
   pub fn dispose(&mut self, object: OpaqueRegionItemRef) -> Option<Block4KPtr>{ unsafe {
@@ -136,14 +190,14 @@ impl SubRegionAllocator {
     let data_loc = header_size.next_multiple_of(env_align);
     let total_size = data_loc + env_size;
 
-    let frame_allocation_limit = PAGE_SIZE - size_of::<RegionMetadata>();
+    let frame_allocation_limit = SMALL_PAGE_SIZE - size_of::<RegionMetadata>();
     if total_size > frame_allocation_limit {
       panic!("Cant allocate this much for single object. Use indirection")
     }
     let region_ref = self.alloc_bytes(
-      total_size, align_of::<TaskFrame>(), page_source);
+      total_size, align_of::<TaskFrame>(), &mut || Some(page_source.get_page()));
 
-    return RegionItemRef(region_ref, PhantomData);
+    return RegionItemRef(region_ref.unwrap(), PhantomData);
   }
 }
 
@@ -204,28 +258,6 @@ impl OpaqueRegionItemRef {
     RegionItemRef(self, PhantomData)
   }
 }
-// it turns out this causes more harm then good
-// impl Drop for SubRegionRef {
-//   fn drop(&mut self) {
-//       panic!(
-//         "The lyfecycle of this object cannot be managed implicitly. It must to be manually disposed into any available SubRegionAllocator")
-//   }
-// }
-
-pub struct Isolated<T>(RegionItemRef<SyncedMtd>, PhantomData<T>);
-impl <T> Isolated<T> {
-  pub fn clone_ref(&self) -> Self {
-    let meta = self.0.deref();
-    meta.ref_count.fetch_add(1, Ordering::AcqRel);
-    let copy = Self(RegionItemRef(self.0.0, PhantomData), PhantomData);
-    return copy
-  }
-}
-// impl <T> Clone for Isolated<T> {
-//   fn clone(&self) -> Self {
-//     self.clone_ref()
-//   }
-// }
 #[repr(C)]
 struct SyncedMtd {
   ref_count: AtomicU32,
@@ -335,7 +367,7 @@ fn io_polling_routine(this: &mut IOPollingWorker) { unsafe {
           let inner_ctx = &mut (*worker.inner_context_ptr.assume_init());
           let mut pager = PageRouter(||{
             (*inner_ctx.stale_page_drainer.assume_init()).try_drain_page().unwrap_or(
-              worker.get_root_allocator().get_block())
+              worker.get_root_allocator().try_get_page_blocking().unwrap())
           });
           while let Some(task) = batch_for_resume.pop() {
             inner_ctx.workset.enque(task, &mut pager)
@@ -618,7 +650,7 @@ impl RetiredPageAggregator {
     Self { free_pages: null_mut() }
   }
   fn store_page(&mut self, page:Block4KPtr) {
-    let ptr = page.get_ptr().cast::<MemBlock4Kb>();
+    let ptr = page.get_data_ptr().cast::<MemBlock4Kb>();
     unsafe {(*ptr).0 = self.free_pages};
     self.free_pages = ptr;
   }
@@ -816,14 +848,10 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
                   if last_child {
                     fence(Ordering::Acquire);
                     exported_context.allocator.dispose(current_task.task_frame_ptr.0);
-
                     let parent_meta = parent_frame.resume_task_meta.assume_init_read();
-
                     current_task.metadata = parent_meta;
                     continuation = parent_frame.continuation.continuation;
-
                     current_task.task_frame_ptr = parent_task;
-
                     continue 'fast_path;
                   } else {
                     exported_context.allocator.dispose(
@@ -902,44 +930,6 @@ fn share_work(
   }
 } }
 
-pub struct Arc<T> { ref_count:AtomicU64, value:T }
-pub struct ArcBox<T>(OpaqueRegionItemRef, PhantomData<T>);
-impl <T>ArcBox<T> {
-  fn as_mut_ptr(&mut self) -> *mut T { unsafe {
-    let val = &mut *self.0.get_data_ptr().cast::<Arc<T>>();
-    return addr_of_mut!(val.value)
-  } }
-}
-impl <T> AsMut<T> for ArcBox<T> {
-  fn as_mut(&mut self) -> &mut T {
-    unsafe { &mut*self.as_mut_ptr() }
-  }
-}
-impl <T> AsRef<T> for ArcBox<T> {
-  fn as_ref(&self) -> &T { unsafe {
-    let val = &*self.0.get_data_ptr().cast::<Arc<T>>();
-    return &val.value
-  } }
-}
-pub struct Boxed<T>(OpaqueRegionItemRef, PhantomData<T>);
-impl <T> Boxed<T> {
-  fn as_mut_ptr(&mut self) -> *mut T { unsafe {
-    let val = &mut *self.0.get_data_ptr().cast::<Arc<T>>();
-    return addr_of_mut!(val.value)
-  } }
-}
-impl <T> AsMut<T> for Boxed<T> {
-  fn as_mut(&mut self) -> &mut T {
-    unsafe { &mut*self.as_mut_ptr() }
-  }
-}
-impl <T> AsRef<T> for Boxed<T> {
-  fn as_ref(&self) -> &T { unsafe {
-    let val = &*self.0.get_data_ptr().cast::<Arc<T>>();
-    return &val.value
-  } }
-}
-
 struct ImmidiateState {
   current_task: MaybeUninit<Task>,
   spawned_subtask_count: u32,
@@ -969,28 +959,6 @@ impl TaskContext {
       retired_page_aggregator
     }))
   }
-  pub fn spawn_synced_data<T:Sync>(&self, data: T) -> Isolated<T> {
-    let this = unsafe { &mut *self.0.get() };
-    let region = unsafe {
-      (*this.worker_inner_context_ref).allocator.alloc_bytes(
-        size_of::<(SyncedMtd, T)>(), align_of::<(SyncedMtd, T)>(),
-        &mut *this.infailable_page_source) };
-    let (mtd, data_) = unsafe{&mut *region.get_data_ptr().cast::<(SyncedMtd, T)>()};
-    *mtd = SyncedMtd {
-      ref_count:AtomicU32::new(1),
-      active_readers_count: AtomicU32::new(0),
-      align_order: align_of::<T>().ilog2() as u8
-    };
-    unsafe {addr_of_mut!(*data_).write(data)};
-    return Isolated(region.bind_type(), PhantomData)
-  }
-  pub fn dispose_synced_data<T>(&self, data: Isolated<T>) {
-    let SyncedMtd { ref_count, .. } = data.0.deref();
-    let rc = ref_count.fetch_sub(1, Ordering::AcqRel);
-    if rc == 1 {
-      unsafe{(*(*self.0.get()).worker_inner_context_ref).allocator.dispose(data.0.0)};
-    }
-  }
   pub fn acccess_frame_as_raw(&self) -> *mut () { unsafe {
     let this = &mut *self.0.get();
     let task = &mut (*this.immidiate_state).current_task;
@@ -1006,48 +974,6 @@ impl TaskContext {
   pub fn consume_frame<T>(&self) -> T {
     unsafe{self.acccess_frame_as_raw().cast::<T>().read()}
   }
-  // does not need destructor
-  pub fn spawn_basic_box<T>(&self, data:T) -> Boxed<T> { unsafe {
-    assert!(!needs_drop::<T>(), "detected value with nontrivial destructor");
-    if size_of::<T>() == 0 {
-      return Boxed(OpaqueRegionItemRef::new_null(), PhantomData)
-    }
-    let this = &mut *self.0.get();
-    let region_ref = (*this.worker_inner_context_ref).allocator.alloc_bytes(
-      size_of::<T>(), align_of::<T>(),
-      &mut*this.infailable_page_source);
-    let loc = region_ref.get_data_ptr();
-    loc.cast::<T>().write(data);
-    return Boxed(region_ref, PhantomData)
-  } }
-  pub fn dispose_basic_box<T>(&self, some_box: Boxed<T>) { unsafe {
-    let this = &mut *self.0.get();
-    if let Some(page) = (*this.worker_inner_context_ref).allocator.dispose(some_box.0) {
-      (*this.retired_page_aggregator).store_page(page)
-    };
-
-  } }
-  pub fn spawn_rc_box<T>(&self, data:T) -> ArcBox<T> { unsafe {
-    assert!(needs_drop::<T>(), "value must provide a destructor");
-    let this = &mut *self.0.get();
-    let region_ref = (*this.worker_inner_context_ref).allocator.alloc_bytes(
-      size_of::<Arc<T>>(), align_of::<Arc<T>>(), &mut*this.infailable_page_source);
-    let loc = region_ref.get_data_ptr();
-    let box_ = loc.cast::<Arc<T>>();
-    (*box_).ref_count = AtomicU64::new(1);
-    addr_of_mut!((*box_).value).write(data);
-    return ArcBox(region_ref, PhantomData)
-  }; }
-  pub fn dispose_rc_box<T>(&self, some_box: ArcBox<T>) { unsafe {
-    let val = &*some_box.0.get_data_ptr().cast::<Arc<T>>();
-    let rc = val.ref_count.fetch_sub(1, Ordering::AcqRel);
-    if rc == 1 {
-      let this = &mut *self.0.get();
-      if let Some(page) = (*this.worker_inner_context_ref).allocator.dispose(some_box.0) {
-        (*this.retired_page_aggregator).store_page(page)
-      }
-    }
-  } }
 
   // parents never get ahead of their children in the execution timeline.
   // subtasks are never parentless
@@ -1301,7 +1227,7 @@ impl WorkGroupRef {
       let inner_ctx = &mut *worker.inner_context_ptr.assume_init();
       let mut infailable_page_source = PageRouter(||{
         (*inner_ctx.stale_page_drainer.assume_init()).try_drain_page()
-        .unwrap_or(worker.get_root_allocator().get_block())
+        .unwrap_or(worker.get_root_allocator().try_get_page_blocking().unwrap())
       });
       let frame_ = inner_ctx.allocator.alloc_task_frame(
         align_of::<Env>(), size_of::<Env>(), &mut infailable_page_source);
@@ -1337,7 +1263,7 @@ impl WorkGroupRef {
       let inner_ctx = &mut *worker.inner_context_ptr.assume_init();
       let mut infailable_page_source = PageRouter(||{
         (*inner_ctx.stale_page_drainer.assume_init()).try_drain_page()
-        .unwrap_or(worker.get_root_allocator().get_block())
+        .unwrap_or(worker.get_root_allocator().try_get_page_blocking().unwrap())
       });
       let frame_ = inner_ctx.allocator.alloc_task_frame(
         align_of::<Env>(), size_of::<Env>(), &mut infailable_page_source);

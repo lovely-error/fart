@@ -8,3 +8,5 @@ edition = "2021"
 [dependencies]
 core_affinity = "0.8.0"
 polling = "2.8.0"
+libc = "*"
+errno = "*"
