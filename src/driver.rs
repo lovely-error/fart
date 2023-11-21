@@ -1,4 +1,5 @@
 
+use core::sync::atomic::compiler_fence;
 use std::{
   sync::{
     atomic::{AtomicU16, Ordering, fence, AtomicU64, AtomicU32, AtomicU8, AtomicBool, },
@@ -506,33 +507,229 @@ fn find_free_index(map: &AtomicU64, total_worker_count: u32) -> Option<u64> {
     }
   }
 }
-struct TaskSet {
-  inline_tasks: InlineLoopBuffer<TASK_CACHE_SIZE, Task>,
-  outline_tasks: TaskCombiner,
+#[repr(C)] #[derive(Debug)]
+struct TaskListPageMtd {
+  next_page: *mut TaskListPage,
 }
-impl TaskSet {
-  fn item_count(&self) -> usize {
-    let inline = self.inline_tasks.item_count();
-    let outline = self.outline_tasks.len();
-    return inline + outline as usize;
-  }
-  fn enque(&mut self, new_item: Task, _: &mut dyn InfailablePageSource) {
-    let did_push = self.inline_tasks.push_to_tail(new_item);
-    if !(did_push) {
-      self.outline_tasks.push(new_item)
+const TASK_LIST_PAGE_PACK_LIMIT : usize = (SMALL_PAGE_SIZE - 1) / size_of::<Simd<u64, 16>>();
+const TASK_LIST_PAGE_ITEM_LIMIT : usize = TASK_LIST_PAGE_PACK_LIMIT * 16;
+#[repr(C)]
+union TaskListPageItemsRepr {
+  simd: [Simd<u64, 16>; TASK_LIST_PAGE_PACK_LIMIT],
+  array: [Task; TASK_LIST_PAGE_ITEM_LIMIT]
+}
+#[repr(C)]
+struct TaskListPage {
+  mtd: TaskListPageMtd,
+  items: TaskListPageItemsRepr
+}
+ensure!(size_of::<TaskListPage>() == SMALL_PAGE_SIZE);
+struct TaskList {
+  read_ptr: *mut (),
+  write_ptr: *mut (),
+  tail_page: *mut TaskListPage,
+  item_count: usize,
+}
+impl TaskList {
+  fn new() -> Self {
+    Self {
+      read_ptr: null_mut(),
+      write_ptr: null_mut(),
+      tail_page: null_mut(),
+      item_count: 0,
     }
   }
-  fn deque_one(&mut self) -> Option<Task> {
-    let task = self.inline_tasks.pop_from_head();
-    return task
+  fn enque_one(
+    &mut self,
+    task: Task,
+    provider: &mut dyn InfailablePageSource
+  ) { unsafe {
+    if self.read_ptr.is_null() {
+      let page = provider.get_page();
+      let ptr = page.get_ptr().cast::<TaskListPage>();
+      let loc = addr_of_mut!((*ptr).items).cast::<()>();
+      self.read_ptr = loc;
+      self.write_ptr = loc;
+      self.tail_page = ptr;
+    }
+    let mut write_ptr = self.write_ptr;
+    let no_spare_space = write_ptr == write_ptr.map_addr(|addr|addr & !(SMALL_PAGE_SIZE - 1));
+    if no_spare_space {
+      let cur_w = write_ptr.byte_sub(SMALL_PAGE_SIZE).cast::<TaskListPage>();
+      let next = (*cur_w).mtd.next_page;
+      if next.is_null() {
+        let new = provider.get_page();
+        let ptr = new.get_ptr().cast::<TaskListPage>();
+        let mtd = &mut (*ptr).mtd;
+        mtd.next_page = null_mut();
+        (*self.tail_page).mtd.next_page = ptr;
+        self.tail_page = ptr;
+        write_ptr = addr_of_mut!((*ptr).items).cast();
+      } else {
+        write_ptr = addr_of_mut!((*next).items).cast();
+      }
+    }
+    let ptr = write_ptr.cast::<Task>();
+    ptr.write(task);
+    self.write_ptr = ptr.add(1).cast();
+    self.item_count += 1;
+  } }
+  fn deque_one(
+    &mut self
+  ) -> Option<(Task, Option<Block4KPtr>)> { unsafe {
+    let count = self.item_count;
+    if count == 0 { return None; }
+    let mut page = None;
+    let mut rp = self.read_ptr.cast::<Task>();
+    let last_item_on_page = rp == rp.map_addr(|addr|addr & !(SMALL_PAGE_SIZE - 1));
+    if last_item_on_page {
+      let mtd_ptr = rp.byte_sub(SMALL_PAGE_SIZE).cast::<TaskListPageMtd>();
+      let mtd = &mut*mtd_ptr;
+      let next = mtd.next_page;
+      if next.is_null() {
+        return None;
+      } else {
+        page = Some(Block4KPtr::new(mtd_ptr.cast()));
+        rp = addr_of_mut!((*next).items).cast();
+      }
+    }
+    let item = rp.read();
+    self.read_ptr = rp.add(1).cast();
+    self.item_count -= 1;
+    return Some((item, page));
+  } }
+  fn dequeue_pack(&mut self) -> Option<(Simd<u64, 16>, usize, Option<Block4KPtr>)> { unsafe {
+    if self.item_count == 0 { return None;}
+    let mut recyc_page = None;
+    let mut rp = self.read_ptr;
+    let last_item_on_page = rp == rp.map_addr(|addr|addr & !(SMALL_PAGE_SIZE - 1));
+    if last_item_on_page {
+      let page = rp.byte_sub(SMALL_PAGE_SIZE).cast::<TaskListPage>();
+      let mtd = &mut(*page).mtd;
+      let next = mtd.next_page;
+      if next.is_null() {
+        // reuse this page
+        let ptr = addr_of_mut!(((*page).items));
+        self.read_ptr = ptr.cast();
+        self.write_ptr = ptr.cast();
+        self.tail_page = page;
+        return None;
+      } else {
+        recyc_page = Some(Block4KPtr::new(page.cast()));
+        rp = addr_of_mut!((*next).items).cast();
+      }
+    }
+    let item = rp.cast::<Simd<u64, 16>>().read();
+    let new_rp = rp.byte_add(size_of::<Simd<u64, 16>>());
+    let reader_got_past_writer =
+      new_rp.byte_sub(1).map_addr(|addr|addr & !(SMALL_PAGE_SIZE - 1)) ==
+      self.write_ptr.byte_sub(1).map_addr(|addr|addr & !(SMALL_PAGE_SIZE - 1)) &&
+      new_rp.expose_addr() > self.write_ptr.expose_addr() ;
+    if reader_got_past_writer {
+      self.write_ptr = new_rp;
+    }
+    self.read_ptr = new_rp;
+    let count = self.item_count;
+    let actual_count = if count >= 16 { 16 } else { count };
+    self.item_count = count - actual_count;
+    return Some((item, actual_count, recyc_page));
+  } }
+}
+#[test]
+fn list_works() {
+  let mut alloc = RootAllocator::new();
+  let mut list = TaskList::new();
+  const LIMIT : usize = 1_000_000;
+  for i in 0 .. LIMIT {
+    list.enque_one(unsafe { transmute(i) }, &mut alloc)
   }
-  fn deque_pack(&mut self) -> Option<(Simd<u64, 32>, u8)> {
-    if let Some(p) = self.outline_tasks.last() {
-      self.outline_tasks.drop_last();
-      return Some(p);
-    } else {
-      return None
-    };
+  let mut got_mem = false;
+  for i in 0 .. LIMIT {
+    let (item, mem) = list.deque_one().unwrap();
+    if let Some(mem) = mem {
+      println!("got mem {:?}", mem);
+      got_mem = true;
+    }
+    if i != unsafe { transmute(item) } {
+      panic!("fk");
+    }
+  }
+  assert!(got_mem)
+}
+#[test]
+fn list_pack_deque_works() {
+  let mut alloc = RootAllocator::new();
+  let mut list = TaskList::new();
+  for i in 0 .. 32usize * 2 {
+    list.enque_one(unsafe { transmute(i) }, &mut alloc);
+    let pack = list.dequeue_pack().unwrap();
+    assert!(pack.0.to_array()[0] == i as _);
+    println!("{:?} {}", pack, i);
+  }
+}
+#[test]
+fn list_pack_deque_works2() {
+  let mut alloc = RootAllocator::new();
+  let mut list = TaskList::new();
+  for i in 0 .. 512usize {
+    list.enque_one(unsafe { transmute(i) }, &mut alloc)
+  }
+  for i in 0 .. (512 / 16) {
+    let pack = list.dequeue_pack().unwrap();
+    println!("{:?} {}", pack, i);
+    list.enque_one(unsafe { transmute(11usize) }, &mut alloc);
+  }
+  println!("delimiter");
+  for i in 0 .. 2 {
+    let pack = list.dequeue_pack().unwrap();
+    assert!(pack.0 == Simd::splat(11));
+    println!("{:?} ix {}", pack, i)
+  }
+}
+#[repr(C)]
+union ImmidiateTasks {
+  simd: Simd<u64, 16>,
+  items: [Task;16],
+  uninit: ()
+}
+struct TaskSet {
+  immidiate_items: ImmidiateTasks,
+  imm_count: u8,
+  task_list: TaskList,
+}
+impl TaskSet {
+  fn new() -> Self {
+    Self {
+      task_list: TaskList::new(),
+      immidiate_items: ImmidiateTasks { uninit: () },
+      imm_count: 0
+    }
+  }
+  fn item_count(&self) -> usize {
+    self.task_list.item_count
+  }
+  fn enque(&mut self, new_item: Task, ps: &mut dyn InfailablePageSource) {
+    self.task_list.enque_one(new_item, ps)
+  }
+  fn deque_one(&mut self) -> Option<(Task, Option<Block4KPtr>)> {
+    let mut mem = None;
+    if self.imm_count == 0 {
+      if let Some((data, len, mem_)) = self.task_list.dequeue_pack() {
+        mem = mem_;
+        self.immidiate_items.simd = data;
+        self.imm_count = len as _;
+      } else {
+        return None;
+      }
+    }
+    let count = self.imm_count - 1;
+    let task = unsafe { self.immidiate_items.items[count as usize] };
+    self.imm_count = count;
+    return Some((task, mem));
+  }
+  fn set_pack(&mut self, pack: Simd<u64,16>, count: usize) {
+    self.immidiate_items.simd = pack;
+    self.imm_count = count as _;
   }
 }
 
@@ -719,52 +916,7 @@ impl FailablePageSource for RetiredPageAggregator {
       self.try_get_page()
   }
 }
-#[repr(C)]
-union TaskPack {
-  items: std::mem::ManuallyDrop<[Task ; 16]>,
-  simd: Simd<u64, 32>
-}
-ensure!(size_of::<[Task ; 16]>() == size_of::<Simd<u64, 32>>());
 
-struct TaskCombiner {
-  data: Vec<TaskPack>,
-  len: usize,
-  subindex: u8,
-}
-impl TaskCombiner {
-  fn new() -> Self {
-    Self { data: Vec::new(), subindex: 0, len: 0 }
-  }
-  fn last(&mut self) -> Option<(Simd<u64, 32>, u8)> {
-    if self.len == 0 {
-      return None
-    }
-    let item = unsafe {self.data.last_mut().unwrap().simd};
-    return Some((item, self.subindex));
-  }
-  fn push(&mut self, task: Task) { unsafe {
-    if self.subindex == 16 || self.data.is_empty() {
-      self.data.push(MaybeUninit::uninit().assume_init());
-      self.subindex = 0;
-    }
-    self.data.last_mut().unwrap().items[self.subindex as usize] = task;
-    self.subindex += 1;
-    self.len += 1;
-  } }
-  fn drop_last(&mut self) {
-    if self.len == 0 { return }
-    self.len -= self.subindex as usize;
-    let _ = self.data.pop();
-    if self.data.is_empty() {
-      self.subindex = 0;
-    } else {
-      self.subindex = 16;
-    }
-  }
-  fn len(&self) -> usize {
-    self.len
-  }
-}
 
 struct WorkerExportContext {
   allocator: SubRegionAllocator,
@@ -785,10 +937,7 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
 
   let mut exported_context = WorkerExportContext {
     allocator: SubRegionAllocator::new(),
-    workset: TaskSet {
-      inline_tasks:InlineLoopBuffer::new(),
-      outline_tasks: TaskCombiner::new()
-    },
+    workset: TaskSet::new(),
     stale_page_drainer: MaybeUninit::uninit()
   };
   // exported_context.workset.outline_tasks.
@@ -820,19 +969,19 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
     addr_of_mut!(infailable_page_source));
   let worker_set = &mut (*worker.work_group).worker_set;
 
+  let mut exec_total = 0u128;
+  let mut exec_runs = 0u128;
+
   let mut exec_state = ExecState::Fetch;
   'dispatch:loop {
     match exec_state {
       ExecState::Fetch => {
-        share_work(worker_set, &mut*workset_);
-        if let Some(new_task) = (*workset_).deque_one() {
+        if let Some((new_task, free_mem)) = (*workset_).deque_one() {
           current_task = new_task;
+          if let Some(free_mem) = free_mem {
+            retired_aggregator.store_page(free_mem);
+          }
           exec_state = ExecState::Execute;
-          continue 'dispatch;
-        }
-        if let Some((pack, count)) = (*workset_).deque_pack() {
-          exported_context.workset.inline_tasks.insert_pack(pack, count as _);
-          exec_state = ExecState::Fetch;
           continue 'dispatch;
         }
         exec_state = ExecState::Sleep;
@@ -859,84 +1008,99 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
       },
       ExecState::Shutdown => {
         retired_aggregator.dispose();
+        let total_time = Duration::from_nanos((exec_total) as u64);
+        println!(
+            "Worker {} spent in total {:?}, average {:?} per workitem",
+            worker.index, total_time, total_time / (exec_runs as u32));
         return;
       }
       ExecState::Execute => {
-        let frame = &mut*current_task.task_frame_ptr.get_frame_ptr();
-        let mut continuation = frame.continuation.continuation;
-        'fast_path: loop {
-          match continuation {
-            ContinuationRepr::Then(thunk) => {
-              let next = thunk(&task_context);
-              fence(Ordering::Release);
-              let produced_subtasks = immidiate_state.spawned_subtask_count != 0;
-              if produced_subtasks {
-                frame.subtask_count.store(
-                  immidiate_state.spawned_subtask_count as u32, Ordering::Relaxed);
-                frame.continuation = next;
-                task_context.clear_dirty_state();
+        let frame_ptr = current_task.task_frame_ptr.get_frame_ptr();
+        let frame = &mut*frame_ptr;
+        let continuation = frame.continuation.continuation;
+        match continuation {
+          ContinuationRepr::Then(thunk) => {
+            let pre = Instant::now();
+            compiler_fence(Ordering::SeqCst);
+
+            let next = thunk(&task_context);
+            fence(Ordering::Release);
+
+            compiler_fence(Ordering::SeqCst);
+            let post = pre.elapsed();
+            exec_total += post.as_nanos();
+            exec_runs += 1;
+
+            frame.continuation = next;
+            let produced_subtasks = immidiate_state.spawned_subtask_count != 0;
+            if produced_subtasks {
+              frame.subtask_count.store(
+                immidiate_state.spawned_subtask_count as u32, Ordering::Relaxed);
+              task_context.clear_dirty_state();
+              // last child awakes parent task
+            } else {
+              // repush task. we want other tasks to run
+              exported_context.workset.enque(
+                current_task, &mut infailable_page_source);
+            }
+            share_work(worker_set, &mut*workset_, &mut retired_aggregator);
+            exec_state = ExecState::Fetch;
+            continue 'dispatch;
+          },
+          ContinuationRepr::Done => {
+            match &frame.dependent_task {
+              Supertask::Thread(awaiting_thread, flag) => {
+                (**flag).store(true, Ordering::Relaxed);
+                awaiting_thread.unpark();
+                if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
+                  retired_aggregator.store_page(page)
+                }
                 exec_state = ExecState::Fetch;
                 continue 'dispatch;
-              } else {
-                continuation = next.continuation;
-                continue 'fast_path
-              }
-            },
-            ContinuationRepr::Done => {
-              match &frame.dependent_task {
-                Supertask::Thread(awaiting_thread, flag) => {
-                  (**flag).store(true, Ordering::Relaxed);
-                  awaiting_thread.unpark();
+              },
+              Supertask::Parent(parked_task) => {
+                let parked_task = *parked_task;
+                let parent_frame = parked_task.get_frame_ptr();
+                let remaining_subtasks_count =
+                  (*parent_frame).subtask_count.fetch_sub(1, Ordering::Relaxed);
+                let last_child = remaining_subtasks_count == 1;
+                if last_child {
+                  fence(Ordering::Acquire);
+                  if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
+                    retired_aggregator.store_page(page)
+                  }
+                  current_task.task_frame_ptr = parked_task;
+                  continue 'dispatch;
+                } else {
                   if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
                     retired_aggregator.store_page(page)
                   }
                   exec_state = ExecState::Fetch;
                   continue 'dispatch;
-                },
-                Supertask::Parent(parked_task) => {
-                  let parked_task = *parked_task;
-                  let parent_frame = parked_task.get_frame_ptr();
-                  let remaining_subtasks_count =
-                    (*parent_frame).subtask_count.fetch_sub(1, Ordering::Relaxed);
-                  let last_child = remaining_subtasks_count == 1;
-                  if last_child {
-                    fence(Ordering::Acquire);
-                    if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
-                      retired_aggregator.store_page(page)
-                    }
-                    current_task.task_frame_ptr = parked_task;
-                    continue 'dispatch;
-                  } else {
-                    if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
-                      retired_aggregator.store_page(page)
-                    }
-                    exec_state = ExecState::Fetch;
-                    continue 'dispatch;
-                  }
-                },
-                Supertask::None => {
-                  if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
-                    retired_aggregator.store_page(page)
-                  };
-                  exec_state = ExecState::Fetch;
-                  continue 'dispatch;
-                },
-              }
-            },
-            ContinuationRepr::AwaitIO(fd, r, w, next) => {
-              (*current_task.task_frame_ptr.get_frame_ptr()).continuation = Continuation {
-                continuation: ContinuationRepr::Then(next)
-              };
-              let item = IOPollingCallbackData {
-                task_to_resume: current_task,
-                target: fd, readable: r, writeable: w
-              };
-              worker.io_tasks_sink.send(item).unwrap();
-              (*(*worker.work_group).worker_set.0.get()).io_thread.wakeup();
-              exec_state = ExecState::Fetch;
-              continue 'dispatch;
-            },
-          }
+                }
+              },
+              Supertask::None => {
+                if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
+                  retired_aggregator.store_page(page)
+                };
+                exec_state = ExecState::Fetch;
+                continue 'dispatch;
+              },
+            }
+          },
+          ContinuationRepr::AwaitIO(fd, r, w, next) => {
+            (*current_task.task_frame_ptr.get_frame_ptr()).continuation = Continuation {
+              continuation: ContinuationRepr::Then(next)
+            };
+            let item = IOPollingCallbackData {
+              task_to_resume: current_task,
+              target: fd, readable: r, writeable: w
+            };
+            worker.io_tasks_sink.send(item).unwrap();
+            (*(*worker.work_group).worker_set.0.get()).io_thread.wakeup();
+            exec_state = ExecState::Fetch;
+            continue 'dispatch;
+          },
         }
       },
     }
@@ -948,37 +1112,32 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
 fn share_work(
   worker_set: &mut WorkerSet,
   workset: *mut TaskSet,
+  page_sink: &mut RetiredPageAggregator
 ) { unsafe {
   // todo: use warp scheduling ?
-  let local_item_count = (*workset).item_count();
-  let have_too_many_tasks = local_item_count > TASK_CACHE_SIZE;
-  if have_too_many_tasks {
-    let ws = &mut *workset;
-    loop {
-      let pack = ws.outline_tasks.last();
-      match pack {
-        Some((pack, count)) => {
-          let maybe_free_worker = worker_set.try_acquire_free_worker_mref();
-          match maybe_free_worker {
-            Some(subordinate_worker) => {
-              ws.outline_tasks.drop_last();
-              subordinate_worker.start();
-              subordinate_worker.with_synced_access(|subordinate_worker|{
-                let subordinates_inner_ctx =
-                  &mut (*subordinate_worker.inner_context_ptr.assume_init());
-                let dst = &mut subordinates_inner_ctx.workset;
-                dst.inline_tasks.insert_pack(pack, count)
-              });
-              continue;
-            },
-            None => {
-              return
-            }
-          }
-        },
-        None => {
-          return
-        },
+  let local_workset = &mut *workset;
+  loop {
+    let local_item_count = local_workset.item_count();
+    let too_few_tasks = TASK_CACHE_SIZE >= local_item_count;
+    if too_few_tasks { return; }
+    let maybe_free_worker = worker_set.try_acquire_free_worker_mref();
+    match maybe_free_worker {
+      Some(subordinate_worker) => {
+        let (pack, len, mem) = local_workset.task_list.dequeue_pack().unwrap();
+        if let Some(mem) = mem {
+          page_sink.store_page(mem)
+        }
+        subordinate_worker.start();
+        subordinate_worker.with_synced_access(|subordinate_worker|{
+          let subordinates_inner_ctx =
+            &mut (*subordinate_worker.inner_context_ptr.assume_init());
+          let dst = &mut subordinates_inner_ctx.workset;
+          dst.set_pack(pack, len);
+        });
+        continue;
+      },
+      None => {
+        return
       }
     }
   }
@@ -1127,20 +1286,17 @@ struct TaskFrame {
 }
 
 #[repr(C)] #[repr(align(8))] #[derive(Debug, Clone, Copy)]
-struct TaskMetadata(u64);
-#[repr(C)] #[repr(align(8))] #[derive(Debug, Clone, Copy)]
 struct Task {
-  metadata: TaskMetadata,
   task_frame_ptr: TaskFrameRef
 }
 impl Task {
   fn new(
     task_frame_ptr: TaskFrameRef,
   ) -> Self {
-    Self { task_frame_ptr, metadata: TaskMetadata(0) }
+    Self { task_frame_ptr }
   }
   fn new_null() -> Self {
-    Self { metadata: TaskMetadata(0), task_frame_ptr: TaskFrameRef(null_mut()) }
+    Self { task_frame_ptr: TaskFrameRef(null_mut()) }
   }
 }
 pub struct WorkGroup {
@@ -1455,7 +1611,7 @@ fn subsyncing() {
         let data = ctx.access_frame_as_init::<Data>();
         let el = data.start_time.unwrap().elapsed();
         println!("time spent {:?}", el);
-        unsafe { data.items.set_len(LIMIT) };
+        // unsafe { data.items.set_len(LIMIT) };
         let mut ix : usize = 0;
         let mut iter = data.items.iter();
         while let Some(item) = iter.next() {
@@ -1483,4 +1639,52 @@ fn alo_fr() {
     subtask_count: AtomicU32::new(1),
     continuation: Continuation { continuation: ContinuationRepr::Done } }) }
   println!("{:?}", unsafe { &*frame });
+}
+
+#[test]
+fn subsyncing2() {
+  const LIMIT : usize = 1_000_000;
+  let wg = WorkGroup::new();
+  let mut st = Vec::<[usize;16]>::new();
+  st.reserve(LIMIT);
+  struct Data { start_time: Option<Instant>, items: Vec<[usize;16]>, counter: AtomicU64 }
+  wg.submit_and_await(Data {items: st, start_time:None, counter: AtomicU64::new(0)}, |ctx| {
+      let data = ctx.access_frame_as_init::<Data>();
+      data.start_time = Some(Instant::now());
+      let ptr = data.items.as_mut_ptr();
+      for i in 0 .. LIMIT {
+          let counter = &data.counter;
+          let ptr = unsafe{ptr.add(i)};
+          let addr : usize = unsafe { transmute(ptr) };
+          ctx.spawn_detached_task((addr, i, counter), |ctx|{
+              let ptr = ctx.access_frame_as_init::<(usize, usize, &AtomicU64)>();
+              let addr = ptr.0;
+              let i = ptr.1;
+              let item_ptr : *mut [usize;16] = unsafe { transmute(addr) };
+              unsafe {item_ptr.write([i;16])};
+              ptr.2.fetch_add(1, Ordering::Release);
+              return Continuation::done()
+          })
+      }
+      return Continuation::then(sync_loop)
+  });
+  fn sync_loop(ctx: &TaskContext) -> Continuation {
+    let data = ctx.access_frame_as_init::<Data>();
+    if data.counter.load(Ordering::Relaxed) != LIMIT as _ {
+      return Continuation::then(sync_loop);
+    }
+    fence(Ordering::Acquire);
+    let el = data.start_time.unwrap().elapsed();
+    println!("time spent {:?}", el);
+    unsafe { data.items.set_len(LIMIT) };
+    let mut ix : usize = 0;
+    let mut iter = data.items.iter();
+    while let Some(item) = iter.next() {
+      for i in item {
+        assert!(*i == ix)
+      }
+      ix += 1
+    }
+    return Continuation::done();
+  }
 }

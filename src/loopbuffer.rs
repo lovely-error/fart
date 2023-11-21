@@ -48,7 +48,7 @@ impl <const Capacity:usize, T> InlineLoopBuffer<Capacity, T> {
   pub fn insert_pack(&self, pack: Simd<u64,32>, len: u8) { unsafe {
     let this = &mut *self.0.get();
     this.read_index = 0;
-    this.write_index = 0;
+    this.write_index = if len == 16 { 0 } else { len as usize };
     this.item_count = len as usize;
     let ptr = this.items.as_mut_ptr().cast::<Simd<u64, 32>>();
     ptr.write_unaligned(pack);

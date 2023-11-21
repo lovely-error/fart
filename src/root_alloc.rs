@@ -83,6 +83,7 @@ impl RootAllocator {
     }
   }
 }
+#[derive(Debug)]
 pub struct Block4KPtr(*mut u8);
 impl Block4KPtr {
   pub fn new(ptr: *mut ()) -> Self {

@@ -1,8 +1,5 @@
 #![feature(pointer_is_aligned)]
-#![feature(pointer_byte_offsets)]
 #![feature(strict_provenance)]
-
-#![feature(const_maybe_uninit_zeroed)]
 #![feature(inline_const)]
 #![feature(const_for)]
 #![feature(const_trait_impl)]
