@@ -154,7 +154,7 @@ impl SubRegionAllocator {
     }
   }; }
   #[must_use]
-  pub fn dispose<T: RegionPtrObject>(&self, object: T) -> Option<Block4KPtr>{ unsafe {
+  pub fn dispose<T: DisposableMemoryObject>(&self, object: T) -> Option<Block4KPtr>{ unsafe {
     let rptr = object.get_region_metadata_ptr();
     let i = (*rptr).ref_count.fetch_sub(1, Ordering::Release) ;
     if i == 1 {
@@ -168,7 +168,8 @@ impl SubRegionAllocator {
     &self,
     env_align: usize,
     env_size: usize,
-    free_page_provider:&mut dyn FnMut() -> Option<Block4KPtr>
+    free_page_provider:&mut dyn FnMut() -> Option<Block4KPtr>,
+    frame_type: TaskFrameType,
   ) -> Option<TaskFrameRef> { unsafe {
     let frame_size = size_of::<RegionMetadata>().next_multiple_of(env_align) + env_size;
     if frame_size >= SMALL_PAGE_SIZE {
@@ -176,6 +177,14 @@ impl SubRegionAllocator {
       errno::set_errno(errno::Errno(libc::EINVAL));
       return None;
     }
+    let (frame_size, frame_align) = match frame_type {
+      TaskFrameType::ThreadResumer =>
+        (size_of::<TaskFrame_ThreadDependent>(), align_of::<TaskFrame_ThreadDependent>()),
+      TaskFrameType::TaskResumer =>
+        (size_of::<TaskFrame_TaskDependent>(), align_of::<TaskFrame_TaskDependent>()),
+      TaskFrameType::Standalone =>
+        (size_of::<TaskFrame_NoDependent>(), align_of::<TaskFrame_NoDependent>()),
+    };
     let this = &mut*self.0.get();
     if this.data.current_page_start.is_null() {
       let smth = free_page_provider();
@@ -194,12 +203,12 @@ impl SubRegionAllocator {
     'attempt:loop {
       let tail = this.data.allocation_tail;
       assert!(tail.expose_addr() != 0);
-      let mtd_ptr = tail.byte_add(tail.align_offset(align_of::<TaskFrame>()));
-      let data_ptr_unal = mtd_ptr.byte_add(size_of::<TaskFrame>());
+      let mtd_ptr = tail.byte_add(tail.align_offset(frame_align));
+      let data_ptr_unal = mtd_ptr.byte_add(frame_size);
       let data_ptr_al = data_ptr_unal.byte_add(data_ptr_unal.align_offset(env_align));
       let data_is_overaligned = data_ptr_al != data_ptr_unal;
       let mtd_ptr = if data_is_overaligned {
-        let ptr = data_ptr_al.byte_sub(size_of::<TaskFrame>());
+        let ptr = data_ptr_al.byte_sub(frame_size);
         assert!(ptr.expose_addr() >= mtd_ptr.expose_addr());
         ptr
       } else {
@@ -229,12 +238,12 @@ impl SubRegionAllocator {
 
       this.data.allocation_tail = next_allocation_tail;
 
-      return Some(TaskFrameRef(mtd_ptr));
+      return Some(TaskFrameRef(data_ptr_al));
     }
   } }
 }
 
-pub trait RegionPtrObject {
+pub trait DisposableMemoryObject {
   fn get_region_metadata_ptr(&self) -> *mut RegionMetadata;
 }
 
@@ -259,7 +268,7 @@ impl <T> RegionItemRef<T> {
     self.0.get_data_ptr().cast()
   }
 }
-impl <T> RegionPtrObject for RegionItemRef<T> {
+impl <T> DisposableMemoryObject for RegionItemRef<T> {
   fn get_region_metadata_ptr(&self) -> *mut RegionMetadata {
     self.0.get_region_origin_ptr().cast()
   }
@@ -289,17 +298,14 @@ impl OpaqueRegionItemRef {
 #[derive(Debug, Clone, Copy)]
 struct TaskFrameRef(*mut u8);
 impl TaskFrameRef {
-    fn get_data_ptr(&self) -> *mut u8 {
-      unsafe { self.0.byte_add(size_of::<TaskFrame>()).cast() }
-    }
-    fn get_frame_ptr(&self) -> *mut TaskFrame {
-      self.0.cast()
+    fn get_middle_ptr(&self) -> *mut () {
+      self.0 as _
     }
     fn get_region_mtd(&self) -> *mut RegionMetadata {
-      self.0.map_addr(|addr| addr & !(SMALL_PAGE_SIZE - 1)).cast()
+      self.0.map_addr(|addr| (addr - 1) & !(SMALL_PAGE_SIZE - 1)).cast()
     }
 }
-impl RegionPtrObject for TaskFrameRef {
+impl DisposableMemoryObject for TaskFrameRef {
   fn get_region_metadata_ptr(&self) -> *mut RegionMetadata {
       self.get_region_mtd()
   }
@@ -997,7 +1003,6 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
             break;
           }
           if worker.flags.is_marked_for_termination() {
-            // clean up
             exec_state = ExecState::Shutdown;
             continue 'dispatch;
           }
@@ -1015,9 +1020,10 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
         return;
       }
       ExecState::Execute => {
-        let frame_ptr = current_task.task_frame_ptr.get_frame_ptr();
-        let frame = &mut*frame_ptr;
-        let continuation = frame.continuation.continuation;
+        let frame_ptr = current_task.get_ptr();
+        let frame_ref =
+          &mut*frame_ptr.cast::<TaskFrame_GenericView>().sub(1);
+        let continuation = frame_ref.continuation.continuation;
         match continuation {
           ContinuationRepr::Then(thunk) => {
             let pre = Instant::now();
@@ -1031,11 +1037,11 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
             exec_total += post.as_nanos();
             exec_runs += 1;
 
-            frame.continuation = next;
+            frame_ref.continuation = next;
             let produced_subtasks = immidiate_state.spawned_subtask_count != 0;
             if produced_subtasks {
-              frame.subtask_count.store(
-                immidiate_state.spawned_subtask_count as u32, Ordering::Relaxed);
+              frame_ref.subtask_count.store(
+                immidiate_state.spawned_subtask_count, Ordering::Relaxed);
               task_context.clear_dirty_state();
               // last child awakes parent task
             } else {
@@ -1048,39 +1054,41 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
             continue 'dispatch;
           },
           ContinuationRepr::Done => {
-            match &frame.dependent_task {
-              Supertask::Thread(awaiting_thread, flag) => {
-                (**flag).store(true, Ordering::Relaxed);
-                awaiting_thread.unpark();
-                if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
+            match current_task.get_frame_type() {
+              TaskFrameType::ThreadResumer => {
+                let frame_ref = &*frame_ptr.cast::<TaskFrame_ThreadDependent>().sub(1);
+                (*frame_ref.wake_flag).store(true, Ordering::Relaxed);
+                frame_ref.awaiting_thread.unpark();
+                if let Some(page) = exported_context.allocator.dispose(current_task) {
                   retired_aggregator.store_page(page)
                 }
                 exec_state = ExecState::Fetch;
                 continue 'dispatch;
               },
-              Supertask::Parent(parked_task) => {
-                let parked_task = *parked_task;
-                let parent_frame = parked_task.get_frame_ptr();
+              TaskFrameType::TaskResumer => {
+                let frame_ref = &*frame_ptr.cast::<TaskFrame_TaskDependent>().sub(1);
+                let parked_task = frame_ref.parent_task;
+                let parent_frame = &*parked_task.get_ptr().cast::<TaskFrame_GenericView>().sub(1);
                 let remaining_subtasks_count =
-                  (*parent_frame).subtask_count.fetch_sub(1, Ordering::Relaxed);
+                  parent_frame.subtask_count.fetch_sub(1, Ordering::Relaxed);
                 let last_child = remaining_subtasks_count == 1;
                 if last_child {
                   fence(Ordering::Acquire);
-                  if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
+                  if let Some(page) = exported_context.allocator.dispose(current_task) {
                     retired_aggregator.store_page(page)
                   }
-                  current_task.task_frame_ptr = parked_task;
+                  current_task = parked_task;
                   continue 'dispatch;
                 } else {
-                  if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
+                  if let Some(page) = exported_context.allocator.dispose(current_task) {
                     retired_aggregator.store_page(page)
                   }
                   exec_state = ExecState::Fetch;
                   continue 'dispatch;
                 }
               },
-              Supertask::None => {
-                if let Some(page) = exported_context.allocator.dispose(current_task.task_frame_ptr) {
+              TaskFrameType::Standalone => {
+                if let Some(page) = exported_context.allocator.dispose(current_task) {
                   retired_aggregator.store_page(page)
                 };
                 exec_state = ExecState::Fetch;
@@ -1089,7 +1097,8 @@ fn worker_processing_routine(worker: &mut Worker) { unsafe {
             }
           },
           ContinuationRepr::AwaitIO(fd, r, w, next) => {
-            (*current_task.task_frame_ptr.get_frame_ptr()).continuation = Continuation {
+            let frame_ref = &mut*current_task.get_ptr().cast::<TaskFrame_GenericView>().sub(1);
+            frame_ref.continuation = Continuation {
               continuation: ContinuationRepr::Then(next)
             };
             let item = IOPollingCallbackData {
@@ -1130,7 +1139,7 @@ fn share_work(
         subordinate_worker.start();
         subordinate_worker.with_synced_access(|subordinate_worker|{
           let subordinates_inner_ctx =
-            &mut (*subordinate_worker.inner_context_ptr.assume_init());
+            &mut*subordinate_worker.inner_context_ptr.assume_init();
           let dst = &mut subordinates_inner_ctx.workset;
           dst.set_pack(pack, len);
         });
@@ -1145,7 +1154,7 @@ fn share_work(
 
 struct ImmidiateState {
   current_task: *const Task,
-  spawned_subtask_count: u32,
+  spawned_subtask_count: u64,
 }
 pub struct TaskContext(UnsafeCell<TaskContextInternals>);
 struct TaskContextInternals {
@@ -1171,7 +1180,7 @@ impl TaskContext {
   }
   pub fn acccess_frame_as_raw(&self) -> *mut () { unsafe {
     let this = &mut *self.0.get();
-    let data_ptr = (*(*this.immidiate_state).current_task).task_frame_ptr.get_data_ptr();
+    let data_ptr = (*(*this.immidiate_state).current_task).get_ptr();
     return data_ptr.cast();
   } }
   pub fn access_frame_as_uninit<T>(&self) -> &mut MaybeUninit<T> { unsafe {
@@ -1192,7 +1201,7 @@ impl TaskContext {
       size_of::<T>(), align_of::<T>(), thunk, false);
     forget(env)
   }
-  // parent does not depend on this subtask
+  // parent does not depend on this task
   pub fn spawn_detached_task<T: Send>(&self, env: T, thunk: Thunk) {
     self.spawn_task_common_impl(
       addr_of!(env).cast::<()>(),
@@ -1206,31 +1215,43 @@ impl TaskContext {
     env_size:usize,
     env_align:usize,
     thunk: Thunk,
-    detached: bool
+    detached: bool,
   ) { unsafe {
     let this = &mut *self.0.get();
     let immidiate_state_ref = &mut *this.immidiate_state;
-
     if !detached {
       immidiate_state_ref.spawned_subtask_count += 1;
     }
-
+    let frame_type = if detached {
+      TaskFrameType::Standalone
+    } else {
+      TaskFrameType::TaskResumer
+    };
     let frame_ref = (*this.worker_inner_context_ref).allocator.alloc_task_frame(
-      env_align, env_size, &mut || Some((*this.infailable_page_source).get_page())).unwrap();
-    let mtd_ptr = frame_ref.get_frame_ptr();
-    mtd_ptr.write(TaskFrame {
-      dependent_task: if !detached {
-        Supertask::Parent((*immidiate_state_ref.current_task).task_frame_ptr)
-      } else {
-        Supertask::None
-      },
-      subtask_count: AtomicU32::new(0),
-      continuation: Continuation { continuation: ContinuationRepr::Then(thunk) }
-    });
-    let data_ptr = frame_ref.get_data_ptr();
+      env_align,
+      env_size,
+      &mut || Some((*this.infailable_page_source).get_page()),
+      frame_type
+    ).unwrap();
+    let middle_ptr = frame_ref.get_middle_ptr();
+    if detached {
+      let frame_ptr = middle_ptr.cast::<TaskFrame_NoDependent>().sub(1);
+      frame_ptr.write(TaskFrame_NoDependent {
+        continuation: Continuation { continuation: ContinuationRepr::Then(thunk) },
+        subtask_count: AtomicU64::new(0)
+      })
+    } else {
+      let frame_ptr = middle_ptr.cast::<TaskFrame_TaskDependent>().sub(1);
+      frame_ptr.write(TaskFrame_TaskDependent {
+        parent_task: immidiate_state_ref.current_task.read(),
+        continuation: Continuation { continuation: ContinuationRepr::Then(thunk) },
+        subtask_count: AtomicU64::new(0)
+      })
+    }
+    let data_ptr = middle_ptr;
     copy_nonoverlapping(env_data.cast::<u8>(), data_ptr.cast::<u8>(), env_size);
 
-    let subtask = Task::new(frame_ref);
+    let subtask = Task::new(frame_ref, frame_type);
     let task_set = &mut (*this.worker_inner_context_ref).workset;
     task_set.enque(subtask, &mut*this.infailable_page_source);
   }; }
@@ -1271,32 +1292,64 @@ impl Continuation {
 }
 type Thunk = fn (&TaskContext) -> Continuation;
 
-#[derive(Debug)]
-enum Supertask {
-  Thread(Thread, *const AtomicBool),
-  Parent(TaskFrameRef),
-  None
+#[derive(Debug, Clone, Copy)] #[repr(u8)]
+enum TaskFrameType {
+  ThreadResumer,
+  TaskResumer,
+  Standalone
 }
 
 #[repr(C)] #[derive(Debug)]
-struct TaskFrame {
-  dependent_task: Supertask,
-  subtask_count: AtomicU32,
-  continuation: Continuation
+struct TaskFrame_ThreadDependent {
+  awaiting_thread: Thread,
+  wake_flag: *const AtomicBool,
+  continuation: Continuation,
+  subtask_count: AtomicU64,
+}
+#[repr(C)] #[derive(Debug)]
+struct TaskFrame_TaskDependent {
+  parent_task: Task,
+  continuation: Continuation,
+  subtask_count: AtomicU64,
+}
+#[repr(C)] #[derive(Debug)]
+struct TaskFrame_NoDependent {
+  continuation: Continuation,
+  subtask_count: AtomicU64,
+}
+#[repr(C)] #[derive(Debug)]
+struct TaskFrame_GenericView {
+  continuation: Continuation,
+  subtask_count: AtomicU64,
 }
 
 #[repr(C)] #[repr(align(8))] #[derive(Debug, Clone, Copy)]
-struct Task {
-  task_frame_ptr: TaskFrameRef
-}
+struct Task(u64);
 impl Task {
   fn new(
     task_frame_ptr: TaskFrameRef,
+    frame_type: TaskFrameType
   ) -> Self {
-    Self { task_frame_ptr }
+    let addr = task_frame_ptr.0.expose_addr();
+    let num = (addr << 8) + unsafe { transmute::<_,u8>(frame_type) as usize };
+    return Self(num as _)
+  }
+  fn get_frame_type(&self) -> TaskFrameType {
+    unsafe { transmute((self.0 & ((1 << 8) - 1)) as u8) }
+  }
+  fn get_ptr(&self) -> *mut () {
+    (self.0 >> 8) as _
   }
   fn new_null() -> Self {
-    Self { task_frame_ptr: TaskFrameRef(null_mut()) }
+    Self(0)
+  }
+  fn get_region_metadata_ptr_(&self) -> *mut RegionMetadata {
+    unsafe{self.get_ptr().map_addr(|addr| (addr - 1) & !(SMALL_PAGE_SIZE - 1)).cast()}
+  }
+}
+impl DisposableMemoryObject for Task {
+  fn get_region_metadata_ptr(&self) -> *mut RegionMetadata {
+    self.get_region_metadata_ptr_()
   }
 }
 pub struct WorkGroup {
@@ -1342,27 +1395,25 @@ impl WorkGroup {
     let total_core_count = core_ids.len();
     let worker_count = total_core_count;
     type WG = WorkGroup;
-    let boxed = alloc(
-      Layout::from_size_align_unchecked(size_of::<WG>(), align_of::<WG>()));
+    let boxed = alloc(Layout::new::<WG>());
     let boxed = boxed.cast::<WG>();
     let (send, recv) = channel();
 
     let mut workers = Vec::new();
     workers.reserve(worker_count);
     for wix in 0 .. worker_count as u32 {
-      let pin = core_ids.get(wix as usize).unwrap().clone();
+      let core_ix = core_ids[wix as usize];
       let worker = Worker {
         index: wix,
         runner_handle: None,
         work_group: boxed,
         flags: WorkerFlags::new(),
         inner_context_ptr: MaybeUninit::uninit(),
-        core_pin_id: pin,
+        core_pin_id: core_ix,
         io_tasks_sink: send.clone()
       };
       workers.push(worker);
     }
-
     boxed.write(WorkGroup {
       ralloc:RootAllocator::new(),
       worker_set: WorkerSet(UnsafeCell::new(WorkerSetData {
@@ -1381,6 +1432,9 @@ impl WorkGroup {
         liveness_count: AtomicU16::new(1) // +1 because ref exist
       })),
     });
+    // starting this is mandatory.
+    // otherwise shutdown will deadlock.
+    // todo: fix it?
     (*(*boxed).worker_set.0.get()).io_thread.start();
 
     return WorkGroupRef(boxed)
@@ -1426,17 +1480,23 @@ impl WorkGroupRef {
         .unwrap_or(worker.get_root_allocator().try_get_page_blocking().unwrap())
       });
       let ptr = inner_ctx.allocator.alloc_task_frame(
-        align_of::<Env>(), size_of::<Env>(), &mut || Some(infailable_page_source.get_page())).unwrap();
-      let frame = ptr.get_frame_ptr();
-      frame.write(TaskFrame {
-        dependent_task: Supertask::Thread(requesting_thread, addr_of!(can_resume)),
-        subtask_count: AtomicU32::new(0),
-        continuation: Continuation { continuation: ContinuationRepr::Then(operation) }
+        align_of::<Env>(),
+        size_of::<Env>(),
+        &mut || Some(infailable_page_source.get_page()),
+        TaskFrameType::ThreadResumer
+      ).unwrap();
+      let middle_ptr = ptr.get_middle_ptr();
+      let frame_ptr = middle_ptr.cast::<TaskFrame_ThreadDependent>().sub(1);
+      frame_ptr.write(TaskFrame_ThreadDependent {
+        awaiting_thread: requesting_thread,
+        wake_flag: addr_of!(can_resume),
+        continuation: Continuation { continuation: ContinuationRepr::Then(operation) },
+        subtask_count: AtomicU64::new(0)
       });
-      let data_ptr = ptr.get_data_ptr();
+      let data_ptr = middle_ptr;
       copy_nonoverlapping(addr_of!(capture).cast::<u8>(), data_ptr.cast::<u8>(), size_of::<Env>());
 
-      let task = Task::new(ptr);
+      let task = Task::new(ptr, TaskFrameType::ThreadResumer);
       inner_ctx.workset.enque(task, &mut infailable_page_source);
     });
     forget(capture);
@@ -1460,17 +1520,21 @@ impl WorkGroupRef {
         .unwrap_or(worker.get_root_allocator().try_get_page_blocking().unwrap())
       });
       let ptr = inner_ctx.allocator.alloc_task_frame(
-        align_of::<Env>(), size_of::<Env>(), &mut || Some(infailable_page_source.get_page())).unwrap();
-      let frame = ptr.get_frame_ptr();
-      frame.write(TaskFrame {
-        dependent_task: Supertask::None,
-        subtask_count: AtomicU32::new(0),
-        continuation: Continuation { continuation: ContinuationRepr::Then(operation) }
+        align_of::<Env>(),
+        size_of::<Env>(),
+        &mut || Some(infailable_page_source.get_page()),
+        TaskFrameType::Standalone
+      ).unwrap();
+      let middle_ptr = ptr.get_middle_ptr();
+      let frame_ptr = middle_ptr.cast::<TaskFrame_NoDependent>().sub(1);
+      frame_ptr.write(TaskFrame_NoDependent {
+        continuation: Continuation { continuation: ContinuationRepr::Then(operation) },
+        subtask_count: AtomicU64::new(0)
       });
-      let data_ptr = ptr.get_data_ptr();
+      let data_ptr = middle_ptr;
       copy_nonoverlapping(addr_of!(capture).cast::<u8>(), data_ptr.cast::<u8>(), size_of::<Env>());
 
-      let task = Task::new(ptr);
+      let task = Task::new(ptr, TaskFrameType::Standalone);
       inner_ctx.workset.enque(task, &mut infailable_page_source);
     });
     forget(capture);
@@ -1625,21 +1689,6 @@ fn subsyncing() {
   });
 }
 
-#[test] #[ignore]
-fn alo_fr() {
-  let ra = RootAllocator::new();
-  let sr = SubRegionAllocator::new();
-  let fr = sr.alloc_task_frame(
-    128, 1, &mut || ra.try_get_page_blocking()).unwrap();
-  let frame = fr.get_frame_ptr();
-  let data = fr.get_data_ptr();
-  println!("{:#?} {:#?} {:#?}", data, frame, unsafe{&*sr.0.get()});
-  unsafe { frame.write(TaskFrame {
-    dependent_task: Supertask::None,
-    subtask_count: AtomicU32::new(1),
-    continuation: Continuation { continuation: ContinuationRepr::Done } }) }
-  println!("{:?}", unsafe { &*frame });
-}
 
 #[test]
 fn subsyncing2() {
