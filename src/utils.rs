@@ -1,3 +1,4 @@
+use core::arch;
 use std::{iter::zip, mem::{align_of, size_of, MaybeUninit, transmute, ManuallyDrop, size_of_val, align_of_val}, ptr::{drop_in_place, copy_nonoverlapping, addr_of, null_mut, Alignment}, cell::UnsafeCell, str::FromStr, time::{SystemTime, Duration}, alloc::{alloc, Layout}, sync::Arc, any::Any};
 
 use crate::root_alloc::Block4KPtr;
@@ -14,7 +15,7 @@ macro_rules! cast {
     ($Val:expr, $Ty:ty) => {
       {
         use core::mem::transmute;
-        unsafe { transmute::<_, $Ty>($Val) }
+        #[allow(unused_unsafe)] unsafe { transmute::<_, $Ty>($Val) }
       }
     };
 }
@@ -190,11 +191,23 @@ fn what_the () {
 }
 
 
-
 #[repr(align(4096))]
 pub(crate) struct MemBlock4Kb(pub(crate)*mut MemBlock4Kb, pub(crate)[u8;4088]);
 
-#[test]
-fn mocha() {
-  println!("{}", (1777 as *mut u8).align_offset(align_of::<u64>()))
+#[macro_export]
+macro_rules! hard_mfence {
+    () => {
+      core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+      #[allow(unused_unsafe)] unsafe { core::arch::x86_64::_mm_mfence() };
+      core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+    };
+}
+
+#[macro_export]
+macro_rules! force_pusblish_stores {
+    () => {
+      core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+      #[allow(unused_unsafe)] unsafe { core::arch::x86_64::_mm_sfence() };
+      core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+    };
 }

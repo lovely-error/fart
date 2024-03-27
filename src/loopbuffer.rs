@@ -35,7 +35,7 @@ impl <const Capacity:usize, T>
     )
   }
 }
-
+#[allow(unused)]
 impl <const Capacity:usize, T> InlineLoopBuffer<Capacity, T> {
   pub fn new() -> Self { unsafe {
     Self(UnsafeCell::new(
@@ -91,6 +91,7 @@ impl <const Capacity:usize, T> InlineLoopBuffer<Capacity, T> {
   }; }
 }
 
+#[allow(non_snake_case)]
 #[inline(never)]
 fn InlineLoopBuffer_push_impl(
   object: &mut dyn InlineLoopBufferDataAccessorImpl,
@@ -109,6 +110,7 @@ fn InlineLoopBuffer_push_impl(
   return true
 }; }
 
+#[allow(non_snake_case)]
 #[inline(never)]
 fn InlineLoopBuffer_pop_from_head_impl(
   object: &mut dyn InlineLoopBufferDataAccessorImpl,
@@ -127,6 +129,7 @@ fn InlineLoopBuffer_pop_from_head_impl(
   return true
 } }
 
+#[allow(non_snake_case)]
 #[inline(never)]
 fn InlineLoopBuffer_pop_from_tail_impl(
   object: &mut dyn InlineLoopBufferDataAccessorImpl,
@@ -229,11 +232,12 @@ impl <const Cap:usize, T>  SomeInlineLoopBuffer for InlineLoopBuffer<Cap, T> {
       self.push_to_tail(new_item)
   }
 }
-
+#[allow(unused)]
 pub struct LoopBufferTraverser<'i, T> {
   source: &'i dyn SomeInlineLoopBuffer<Item = T>,
   current_index: usize
 }
+#[allow(unused)]
 impl <'i, T> LoopBufferTraverser<'i, T> {
   pub fn new<const Cap:usize>(source: &'i InlineLoopBuffer<Cap, T>) -> Self {
     Self {

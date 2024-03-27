@@ -1,54 +1,76 @@
 
 use core::{sync::atomic::AtomicUsize, alloc::GlobalAlloc};
-use std::{alloc::{alloc, Layout}, sync::atomic::{AtomicU16, Ordering, fence}, cell::UnsafeCell, thread, ptr::{null_mut, addr_of, slice_from_raw_parts}, mem::size_of};
+use std::{alloc::{alloc, Layout}, cell::UnsafeCell, mem::size_of, os::raw::c_int, ptr::{addr_of, null_mut, slice_from_raw_parts}, sync::atomic::{fence, AtomicU16, Ordering}, thread};
 
-use crate::{cast, utils::InfailablePageSource};
+use crate::{cast, force_pusblish_stores, utils::InfailablePageSource};
 use libc::{
-  self, PROT_READ, PROT_WRITE, MAP_ANONYMOUS, MAP_PRIVATE, MAP_HUGE_2MB, ENOMEM, MAP_FAILED
+  self, ENOMEM, MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_HUGE_2MB, MAP_PRIVATE, PROT_READ, PROT_WRITE
 };
-const SMALL_PAGE_SIZE: usize = 4096;
+
 const PAGE_2MB_SIZE: usize = 1 << 21;
 const PAGE_2MB_ALIGN: usize = 1 << 21;
 const SMALL_PAGE_LIMIT: usize = PAGE_2MB_SIZE / 4096;
+
+#[derive(Debug, Clone, Copy)]
+pub enum AllocationFailure {
+  WouldBlock, NoMem
+}
 
 pub struct RootAllocator(UnsafeCell<RootAllocatorInner>);
 struct RootAllocatorInner {
   super_page_start: *mut [u8;4096],
   index: AtomicUsize,
+  huge_pages_enabled: bool,
 }
 unsafe impl Sync for RootAllocator {}
 impl RootAllocator {
-  fn alloc_superpage() -> Option<*mut u8> { unsafe {
+  fn alloc_superpage(&self) -> Result<*mut u8, AllocationFailure> { unsafe {
+    let attrs: c_int = if (*self.0.get()).huge_pages_enabled {
+      MAP_HUGE_2MB | MAP_HUGETLB
+    } else {
+      0
+    };
     let mut mem = libc::mmap64(
         null_mut(),
         PAGE_2MB_SIZE,
         PROT_READ | PROT_WRITE,
-        MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGE_2MB,
+        MAP_ANONYMOUS | MAP_PRIVATE | attrs,
         -1,
         0);
     if mem == MAP_FAILED {
-      return None;
+      let err = errno::errno().0;
+      let err = match err {
+        libc::EPERM |
+        libc::ENODEV |
+        libc::ENFILE |
+        libc::ENOMEM => AllocationFailure::NoMem,
+        _ => unreachable!()
+      };
+      return Err(err);
     }
     let out = libc::posix_memalign(&mut mem, PAGE_2MB_ALIGN, PAGE_2MB_SIZE);
     if out != 0 {
-      return None;
+      return Err(AllocationFailure::NoMem);
     }
-    return Some(mem.cast())
+    return Ok(mem.cast())
   } }
-  pub fn new() -> Self {
+  pub fn new(
+    enable_huge_pages: bool
+  ) -> Self {
     Self(
       UnsafeCell::new(RootAllocatorInner {
         super_page_start: null_mut(),
-        index: AtomicUsize::new(SMALL_PAGE_LIMIT << 1)
+        index: AtomicUsize::new(SMALL_PAGE_LIMIT << 1),
+        huge_pages_enabled: enable_huge_pages
       })
     )
   }
   #[inline(never)]
-  pub fn try_get_page_nonblocking(&self) -> Option<Block4KPtr> {
+  pub fn try_get_page_nonblocking(&self) -> Result<Block4KPtr, AllocationFailure> {
     let this = unsafe{&mut*self.0.get()};
     let offset = this.index.fetch_add(1 << 1, Ordering::Relaxed);
     let locked = offset & 1 == 1;
-    if locked { return None }
+    if locked { return Err(AllocationFailure::WouldBlock) }
     let mut index = offset >> 1;
     let did_overshoot = index >= SMALL_PAGE_LIMIT;
     if did_overshoot {
@@ -56,29 +78,35 @@ impl RootAllocator {
       let already_locked = item & 1 == 1;
       if already_locked {
         errno::set_errno(errno::Errno(libc::EWOULDBLOCK));
-        return None
+        return Err(AllocationFailure::WouldBlock);
       }
       else { // we gotta provide new page
-        let page = Self::alloc_superpage()?;
+        let page = match self.alloc_superpage() {
+            Ok(mem) => mem,
+            Err(err) => {
+              this.index.fetch_and((!0) << 1, Ordering::Relaxed);
+              return Err(err);
+            },
+        };
         this.super_page_start = page.cast();
+        force_pusblish_stores!();
         this.index.store(1 << 1, Ordering::Release);
         index = 0;
       }
     };
-    fence(Ordering::Acquire); // we must see that page got allocated
     let ptr = unsafe { this.super_page_start.add(index) };
-    return Some(Block4KPtr(ptr.cast()));
+    return Ok(Block4KPtr(ptr.cast()));
   }
-  pub fn try_get_page_blocking(&self) -> Option<Block4KPtr> {
+  pub fn try_get_page_blocking(&self) -> Result<Block4KPtr, AllocationFailure> {
     loop {
-      if let k@Some(_) = self.try_get_page_nonblocking() {
-        return k;
-      } else {
-        let errno = errno::errno();
-        match errno.0 {
-          libc::EWOULDBLOCK => continue,
-          _ => return None
-        }
+      match self.try_get_page_nonblocking() {
+        Ok(mem) => return Ok(mem),
+        Err(err) => {
+          match err {
+            AllocationFailure::WouldBlock => continue,
+            _ => return Err(err)
+          }
+        },
       }
     }
   }
@@ -98,8 +126,8 @@ impl Block4KPtr {
 #[test]
 fn alloc_works() {
   // this will eat a lot of ram, fix it if not disposed properly
-  const THREAD_COUNT:usize = 4096;
-  let ralloc = RootAllocator::new();
+  const THREAD_COUNT:usize = 4096 * 4;
+  let ralloc = RootAllocator::new(false);
   let ptrs: [*mut u32;THREAD_COUNT] = [null_mut(); THREAD_COUNT];
   thread::scope(|s|{
     for i in 0 .. THREAD_COUNT {
@@ -108,7 +136,7 @@ fn alloc_works() {
       s.spawn(move || {
         let ptr;
         loop {
-          if let Some(ptr_) = unique_ref.try_get_page_nonblocking() {
+          if let Ok(ptr_) = unique_ref.try_get_page_blocking() {
             ptr = ptr_; break;
           };
         }

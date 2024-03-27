@@ -7,8 +7,14 @@
 #![feature(ptr_alignment_type)]
 #![feature(portable_simd)]
 
+#[allow(unused_imports)]
 pub mod driver;
+#[allow(unused_imports)]
 mod root_alloc;
+#[allow(unused)]
 mod utils;
+#[allow(unused_imports)]
+#[allow(non_upper_case_globals)]
 mod loopbuffer;
+#[allow(unused_imports)]
 mod array;

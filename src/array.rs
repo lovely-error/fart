@@ -1,5 +1,5 @@
-use std::{marker::PhantomData, ptr::{null_mut, copy_nonoverlapping, addr_of, addr_of_mut}, mem::{size_of, MaybeUninit, forget}, cell::UnsafeCell};
 
+use std::{marker::PhantomData, ptr::{null_mut, copy_nonoverlapping, addr_of, addr_of_mut}, mem::{size_of, MaybeUninit, forget}, cell::UnsafeCell};
 use crate::{root_alloc::{RootAllocator, Block4KPtr}, cast, utils::{FailablePageSource, InfailablePageSource}};
 
 
@@ -208,7 +208,7 @@ fn Array_pop_impl(
 
 #[test]
 fn pushespops_repsect_boundries() {
-  let mut ralloc = RootAllocator::new();
+  let mut ralloc = RootAllocator::new(false);
   type Item = u32;
   let arr = Array::<Item>::new();
   let limit = 4096 / size_of::<Item>();
@@ -232,7 +232,7 @@ fn pushespops_repsect_boundries() {
 
 #[test]
 fn weirdly_sized_pushespops_repsect_boundries() {
-  let mut ralloc = RootAllocator::new();
+  let mut ralloc = RootAllocator::new(false);
   type Item = [u8;3];
   let arr = Array::<Item>::new();
   let page_capacity = 4096 / size_of::<Item>();
@@ -265,7 +265,7 @@ fn weirdly_sized_pushespops_repsect_boundries() {
 
 #[test]
 fn indexing_works() {
-  let mut ralloc = RootAllocator::new();
+  let mut ralloc = RootAllocator::new(false);
   let arr = Array::<u32>::new();
   for i in 0 .. 4096 {
     arr.push(i, &mut ralloc)
@@ -301,7 +301,7 @@ impl <T> FailablePageSource for Array<T> {
 
 #[test]
 fn draining_works() { unsafe {
-  let mut ralloc = RootAllocator::new();
+  let mut ralloc = RootAllocator::new(false);
   let mut arr = Array::<u64>::new();
   for i in 0 .. 512 {
     arr.push(i, &mut ralloc);
@@ -325,7 +325,7 @@ fn draining_works() { unsafe {
 
 #[test]
 fn draining_on_empty() {
-  let mut ralloc = RootAllocator::new();
+  let mut ralloc = RootAllocator::new(false);
   let mut arr = Array::<u64>::new();
 
   let smth = arr.try_drain_page();
@@ -337,7 +337,7 @@ fn draining_on_empty() {
 
 #[test]
 fn inout_lots() {
-  let mut ralloc = RootAllocator::new();
+  let mut ralloc = RootAllocator::new(false);
   let arr = Array::new();
   const LIMIT : usize = 1_000_000;
   for i in 0 .. LIMIT {
