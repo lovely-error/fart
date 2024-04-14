@@ -6,6 +6,8 @@
 #![feature(const_mut_refs)]
 #![feature(ptr_alignment_type)]
 #![feature(portable_simd)]
+#![feature(offset_of)]
+#![feature(generic_arg_infer)]
 
 #[allow(unused_imports)]
 pub mod driver;
@@ -18,3 +20,4 @@ mod utils;
 mod loopbuffer;
 #[allow(unused_imports)]
 mod array;
+mod futex;

@@ -1,4 +1,4 @@
-use core::arch;
+use core::{arch, ptr::null};
 use std::{iter::zip, mem::{align_of, size_of, MaybeUninit, transmute, ManuallyDrop, size_of_val, align_of_val}, ptr::{drop_in_place, copy_nonoverlapping, addr_of, null_mut, Alignment}, cell::UnsafeCell, str::FromStr, time::{SystemTime, Duration}, alloc::{alloc, Layout}, sync::Arc, any::Any};
 
 use crate::root_alloc::Block4KPtr;
@@ -111,11 +111,9 @@ fn guard_guards() {}
 
 
 pub trait FailablePageSource {
-  fn try_drain_page(&mut self) -> Option<Block4KPtr>;
+  fn try_drain_page(&self) -> Option<Block4KPtr>;
 }
-pub trait InfailablePageSource {
-  fn get_page(&mut self) -> Block4KPtr;
-}
+
 
 #[test]
 fn fat_ptr_to_object() {
@@ -188,6 +186,8 @@ fn what_the () {
   }
   let thing = async_();
   println!("{}", size_of_val(&thing));
+  // core::sync::atomic::compiler_fence(order)
+
 }
 
 
@@ -209,5 +209,24 @@ macro_rules! force_pusblish_stores {
       core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
       #[allow(unused_unsafe)] unsafe { core::arch::x86_64::_mm_sfence() };
       core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+    };
+}
+#[macro_export]
+macro_rules! force_publish_stores_on_location {
+    ($data:expr, $size:expr, $cl_size:expr) => {
+      {
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        let mut ptr = $data.cast::<u8>();
+        let span = ($size + ($cl_size - 1)) / $cl_size;
+        #[allow(unused_unsafe)] unsafe {
+          for _ in 0 .. span {
+            // core::arch::x86_64::_mm_clflush(ptr.cast());
+            core::arch::asm!(
+              "clflush [{v}]", v = in(reg) ptr,
+            );
+            ptr = ptr.byte_add($cl_size);
+          }
+        }
+      }
     };
 }

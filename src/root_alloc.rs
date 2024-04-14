@@ -2,7 +2,7 @@
 use core::{sync::atomic::AtomicUsize, alloc::GlobalAlloc};
 use std::{alloc::{alloc, Layout}, cell::UnsafeCell, mem::size_of, os::raw::c_int, ptr::{addr_of, null_mut, slice_from_raw_parts}, sync::atomic::{fence, AtomicU16, Ordering}, thread};
 
-use crate::{cast, force_pusblish_stores, utils::InfailablePageSource};
+use crate::{cast, force_pusblish_stores, utils::FailablePageSource};
 use libc::{
   self, ENOMEM, MAP_ANONYMOUS, MAP_FAILED, MAP_HUGETLB, MAP_HUGE_2MB, MAP_PRIVATE, PROT_READ, PROT_WRITE
 };
@@ -13,7 +13,7 @@ const SMALL_PAGE_LIMIT: usize = PAGE_2MB_SIZE / 4096;
 
 #[derive(Debug, Clone, Copy)]
 pub enum AllocationFailure {
-  WouldBlock, NoMem
+  WouldRetry, NoMem
 }
 
 pub struct RootAllocator(UnsafeCell<RootAllocatorInner>);
@@ -66,19 +66,18 @@ impl RootAllocator {
     )
   }
   #[inline(never)]
-  pub fn try_get_page_nonblocking(&self) -> Result<Block4KPtr, AllocationFailure> {
+  pub fn try_get_page_fast_bailout(&self) -> Result<Block4KPtr, AllocationFailure> {
     let this = unsafe{&mut*self.0.get()};
     let offset = this.index.fetch_add(1 << 1, Ordering::Relaxed);
     let locked = offset & 1 == 1;
-    if locked { return Err(AllocationFailure::WouldBlock) }
+    if locked { return Err(AllocationFailure::WouldRetry) }
     let mut index = offset >> 1;
     let did_overshoot = index >= SMALL_PAGE_LIMIT;
     if did_overshoot {
       let item = this.index.fetch_or(1, Ordering::Relaxed);
       let already_locked = item & 1 == 1;
       if already_locked {
-        errno::set_errno(errno::Errno(libc::EWOULDBLOCK));
-        return Err(AllocationFailure::WouldBlock);
+        return Err(AllocationFailure::WouldRetry);
       }
       else { // we gotta provide new page
         let page = match self.alloc_superpage() {
@@ -97,13 +96,13 @@ impl RootAllocator {
     let ptr = unsafe { this.super_page_start.add(index) };
     return Ok(Block4KPtr(ptr.cast()));
   }
-  pub fn try_get_page_blocking(&self) -> Result<Block4KPtr, AllocationFailure> {
+  pub fn try_get_page_wait_tolerable(&self) -> Result<Block4KPtr, AllocationFailure> {
     loop {
-      match self.try_get_page_nonblocking() {
+      match self.try_get_page_fast_bailout() {
         Ok(mem) => return Ok(mem),
         Err(err) => {
           match err {
-            AllocationFailure::WouldBlock => continue,
+            AllocationFailure::WouldRetry => continue,
             _ => return Err(err)
           }
         },
@@ -111,7 +110,7 @@ impl RootAllocator {
     }
   }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Block4KPtr(*mut u8);
 impl Block4KPtr {
   pub fn new(ptr: *mut ()) -> Self {
@@ -122,6 +121,21 @@ impl Block4KPtr {
     self.0 as _
   }
 }
+
+impl FailablePageSource for RootAllocator {
+    fn try_drain_page(&self) -> Option<Block4KPtr> {
+      match self.try_get_page_wait_tolerable() {
+        Ok(mem) => Some(mem),
+        Err(err) => match err {
+          AllocationFailure::WouldRetry => unreachable!(),
+          AllocationFailure::NoMem => return None,
+        },
+      }
+    }
+}
+
+
+
 
 #[test]
 fn alloc_works() {
@@ -136,7 +150,7 @@ fn alloc_works() {
       s.spawn(move || {
         let ptr;
         loop {
-          if let Ok(ptr_) = unique_ref.try_get_page_blocking() {
+          if let Ok(ptr_) = unique_ref.try_get_page_wait_tolerable() {
             ptr = ptr_; break;
           };
         }
@@ -154,11 +168,5 @@ fn alloc_works() {
     for s in sl {
         assert!(*s == i as u32, "threads got same memory region!!!");
     }
-  }
-}
-
-impl InfailablePageSource for RootAllocator {
-  fn get_page(&mut self) -> Block4KPtr {
-    self.try_get_page_blocking().unwrap()
   }
 }
