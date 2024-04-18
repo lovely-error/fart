@@ -14,7 +14,7 @@ use libc::NFT_SET_ANONYMOUS;
 use polling::{Poller, Source, Event};
 
 use crate::{
-  ensure, force_publish_stores_on_location, force_pusblish_stores, hard_mfence, root_alloc::{Block4KPtr, RootAllocator}, utils::FailablePageSource
+  static_assert, force_publish_stores_on_location, force_pusblish_stores, hard_mfence, root_alloc::{Block4KPtr, RootAllocator}, utils::FailablePageSource
 };
 use crate::futex;
 
@@ -32,7 +32,7 @@ struct SlabPage {
   ref_count: AtomicU32,
   cells: [SlabCell;SLAB_MAX_COUNT]
 }
-ensure!(size_of::<SlabPage>() == SMALL_PAGE_SIZE);
+static_assert!(size_of::<SlabPage>() == SMALL_PAGE_SIZE);
 const SLAB_MAX_COUNT: usize = (4096 - 1) / size_of::<SlabCell>();
 struct WorkerLocalSlabAllocatorInner {
   page_origin_addr: *mut SlabPage,
@@ -467,7 +467,7 @@ struct TaskListPage {
   mtd: TaskListPageMtd,
   items: TaskListPageItemsRepr
 }
-ensure!(size_of::<TaskListPage>() == SMALL_PAGE_SIZE);
+static_assert!(size_of::<TaskListPage>() == SMALL_PAGE_SIZE);
 struct TaskList {
   read_ptr: *mut (),
   write_ptr: *mut (),
@@ -1018,9 +1018,7 @@ fn worker_processing_routine(worker_: *mut Worker) { unsafe {
 
   let allocator = WorkerLocalSlabAllocator::new();
   let mut task_set = TaskSet::new();
-
   let mut page_man_ = PageStorage::new(this_worker.get_root_allocator());
-
 
   let mut current_task : TaskRef = TaskRef::new_null();
 
@@ -1555,26 +1553,27 @@ impl WorkGroup {
     })
   }
   #[allow(dead_code)]
-  #[inline(always)]
   fn new_with_thread_count(
     thread_count:usize
-  ) -> Result<WorkGroupRef, WorkGroupCreationError> {
-    if thread_count == 0 { return Err(WorkGroupCreationError::RequestedZeroWorkers);}
+  ) -> WorkGroupRef {
     let core_ids = Self::get_core_ids();
     let total_core_count = core_ids.len();
-    if thread_count > total_core_count {
-      return Err(WorkGroupCreationError::CoreScarcityError {
-        present_core_count: total_core_count as _
-      })
-    }
+    assert!(thread_count != 0 || thread_count <= total_core_count);
     let enable_huge = match std::env::var("HUGE_PAGES") {
         Ok(str) if str == "1" => true,
         _ => false,
     };
-    return Ok(Self::new_common_impl(&core_ids[..thread_count], enable_huge))
+    return Self::new_common_impl(&core_ids[..thread_count], enable_huge)
   }
-  #[inline(always)]
   pub fn new() -> WorkGroupRef {
+    let () = {
+      let res = unsafe { core::arch::x86_64::__cpuid(1) };
+      let cl_flush_enabled = (res.edx >> 19) & 1 == 1;
+      assert!(cl_flush_enabled, "CPU doesnt have clflush instruction.");
+      let cl_size = (res.ebx >> 8 & (1 << 7) - 1) * 8;
+      let size_ok = cl_size >= 64;
+      assert!(size_ok, "Unexpected cache line size.");
+    };
     let core_ids = Self::get_core_ids();
     let enable_huge = match std::env::var("HUGE_PAGES") {
         Ok(str) if str == "1" => true,
@@ -1798,7 +1797,7 @@ fn heavy_spawning() {
 #[test]
 fn subsyncing() {
   const LIMIT : usize = 1_000_000;
-  let wg = WorkGroup::new_with_thread_count(1).unwrap();
+  let wg = WorkGroup::new_with_thread_count(1);
   let mut st = Vec::<[usize;16]>::new();
   st.reserve(LIMIT);
   struct Data { start_time: Option<Instant>, items: Vec<[usize;16]> }

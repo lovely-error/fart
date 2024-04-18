@@ -1,23 +1,53 @@
 #![feature(pointer_is_aligned)]
 #![feature(strict_provenance)]
-#![feature(inline_const)]
-#![feature(const_for)]
-#![feature(const_trait_impl)]
-#![feature(const_mut_refs)]
 #![feature(ptr_alignment_type)]
 #![feature(portable_simd)]
 #![feature(offset_of)]
 #![feature(generic_arg_infer)]
+#![feature(let_chains)]
 
-#[allow(unused_imports)]
-pub mod driver;
-#[allow(unused_imports)]
+#[cfg(not(target_os = "linux"))]
+  compile_error!(
+    "It only works on linux"
+  );
+#[cfg(not(target_endian = "little"))]
+  compile_error!(
+    "It only works on little endian"
+  );
+#[cfg(not(target_has_atomic = "64"))]
+  compile_error!(
+    "This software needs atomics"
+  );
+#[cfg(not(target_pointer_width = "64"))]
+  compile_error!(
+    "Only 64 bit arches are supported"
+  );
+#[cfg(not(target_arch= "x86_64"))]
+  compile_error!(
+    "Only x86_64 is supported at this point, sorry"
+  );
+
+
+
 mod root_alloc;
 #[allow(unused)]
 mod utils;
-#[allow(unused_imports)]
-#[allow(non_upper_case_globals)]
 mod loopbuffer;
-#[allow(unused_imports)]
 mod array;
+#[allow(dead_code)]
 mod futex;
+
+mod driver_async;
+
+pub use driver_async::{
+  launch_detached,
+  run_isolated,
+  wait_on_fd,
+  yield_now,
+  FaRT,
+  RtRef,
+};
+
+
+// #[allow(unused_imports)]
+// mod fd_table;

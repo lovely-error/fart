@@ -3,49 +3,14 @@ use std::{iter::zip, mem::{align_of, size_of, MaybeUninit, transmute, ManuallyDr
 
 use crate::root_alloc::Block4KPtr;
 
-#[macro_export]
-macro_rules! ensure {
+
+macro_rules! static_assert {
     ($cond:expr) => {
-      const _ : () = if !$cond { panic!("static check failed") } ;
+      const _ : () = if !$cond { std::panic!("Comptime assert failed!") } ;
     };
-}
-
-#[macro_export]
-macro_rules! cast {
-    ($Val:expr, $Ty:ty) => {
-      {
-        use core::mem::transmute;
-        #[allow(unused_unsafe)] unsafe { transmute::<_, $Ty>($Val) }
-      }
+    ($cond:expr, $msg:expr) => {
+      const _ : () = if !$cond { panic!($msg) } ;
     };
-}
-
-pub fn high_order_pow2(number: u64) -> u64 {
-  64u64 - (number - 1).leading_zeros() as u64
-}
-#[test]
-fn valid_order_count() {
-  let nums = [
-    0, 1, 3, 5, 7, 11, 13, 17, 23];
-  let orders = [
-    0, 1, 2, 3, 3, 4, 4, 5, 5];
-  for (n, o) in zip(nums, orders) {
-    assert!(high_order_pow2(n) == o);
-  }
-}
-
-#[test]
-fn bool_to_int() {
-  assert!(1u8 == unsafe { transmute(true) });
-  assert!(0u8 == unsafe { transmute(false) })
-}
-
-
-pub fn measure_exec_time(action: impl FnOnce()) -> Duration {
-  let begin = SystemTime::now();
-  action();
-  let diff = begin.elapsed().unwrap();
-  return diff
 }
 
 pub struct RestoreGuard<T>(UnsafeCell<(*mut T, bool)>);
@@ -86,47 +51,10 @@ fn quick_sanity_check(){
   });
   assert!(val.0 == String::from_str("yeah..").unwrap())
 }
-#[test]
-fn no_double_free () {}
-
-#[test]
-fn guard_guards() {}
-
-
-// pub unsafe fn bitcopy<T>(val: &T) -> T {
-//   transmute::<_, *const T>(val).read()
-// }
-
-
-// #[macro_export]
-// macro_rules! unborrowcheck {
-//   ($expr:expr, $Ty:ty) => {
-//     {
-//       use std::mem::transmute;
-//       let copied_mref = transmute::<_, u64>($expr);
-//       move || { &mut *transmute::<_, *mut $Ty>(copied_mref) }
-//     }
-//   };
-// }
 
 
 pub trait FailablePageSource {
   fn try_drain_page(&self) -> Option<Block4KPtr>;
-}
-
-
-#[test]
-fn fat_ptr_to_object() {
-  let size = size_of::<*mut dyn FailablePageSource>();
-  assert!(size == 16)
-  // println!("{}", size)
-}
-
-
-#[test]
-fn no_aslr() {
-  let alloc = unsafe { alloc(Layout::from_size_align_unchecked(1 << 21, 4096)) };
-  println!("{} {}", alloc as u64, (alloc as u64 >> 12) > u32::MAX as u64)
 }
 
 #[repr(C)]
@@ -147,86 +75,29 @@ fn bitcasting() {
   let casted = bitcast::<_, [u8;3]>(val);
   assert!(casted == [0u8;3]);
 }
-
-#[test]
-fn size_of_counter() {
-  println!("{}", size_of::<Arc<String>>())
-}
-
-pub fn aligned_for<T>(ptr: *const ()) -> bool {
-  let align = align_of::<T>();
-  assert!(align.is_power_of_two());
-  let ptr = ptr as u64;
-  let tr = ptr.trailing_zeros();
-  let align_order = align.trailing_zeros();
-  let ok = tr >= align_order;
-  return ok
-}
-
-trait ExposesTraversableContiguosMemory {
-  type Item;
-  fn next_contiguos_block(&mut self) -> Option<(*mut Self::Item, usize)>;
-}
-
-pub trait SomeDebug: Any + std::fmt::Debug + Clone {}
-type __ = Box<dyn SomeDebug>;
-
-#[test] #[ignore]
-fn what_the () {
-  async fn async_ () {
-    let str = async_2().await;
-    let id = what().await.type_id();
-    println!("{} {:?}", str, id)
-  }
-  async fn async_2 () -> String {
-    return String::from_str("???").unwrap()
-  }
-  async fn what() -> impl Any {
-    return 0u64
-  }
-  let thing = async_();
-  println!("{}", size_of_val(&thing));
-  // core::sync::atomic::compiler_fence(order)
-
-}
-
-
 #[repr(align(4096))]
 pub(crate) struct MemBlock4Kb(pub(crate)*mut MemBlock4Kb, pub(crate)[u8;4088]);
 
-#[macro_export]
-macro_rules! hard_mfence {
-    () => {
-      core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-      #[allow(unused_unsafe)] unsafe { core::arch::x86_64::_mm_mfence() };
-      core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-    };
-}
 
-#[macro_export]
-macro_rules! force_pusblish_stores {
-    () => {
-      core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-      #[allow(unused_unsafe)] unsafe { core::arch::x86_64::_mm_sfence() };
-      core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-    };
+#[inline(always)]
+pub(crate)
+fn publish_changes_on_memory(
+  start_address: *const (),
+  bytes: usize
+) {
+  let span = bytes.next_multiple_of(64) >> 6;
+  let mut addr = start_address.expose_addr();
+  for _ in 0 .. span {
+    unsafe {
+      core::arch::x86_64::_mm_clflush(addr as _);
+      addr += 64;
+    }
+  }
 }
-#[macro_export]
-macro_rules! force_publish_stores_on_location {
-    ($data:expr, $size:expr, $cl_size:expr) => {
-      {
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        let mut ptr = $data.cast::<u8>();
-        let span = ($size + ($cl_size - 1)) / $cl_size;
-        #[allow(unused_unsafe)] unsafe {
-          for _ in 0 .. span {
-            // core::arch::x86_64::_mm_clflush(ptr.cast());
-            core::arch::asm!(
-              "clflush [{v}]", v = in(reg) ptr,
-            );
-            ptr = ptr.byte_add($cl_size);
-          }
-        }
-      }
-    };
+#[inline(always)]
+pub(crate)
+fn publish_changes_on_object<T>(
+  address: *const T,
+) {
+  publish_changes_on_memory(address.cast(), size_of::<T>())
 }

@@ -1,6 +1,7 @@
 
-use std::{marker::PhantomData, ptr::{null_mut, copy_nonoverlapping, addr_of, addr_of_mut}, mem::{size_of, MaybeUninit, forget}, cell::UnsafeCell};
-use crate::{root_alloc::{RootAllocator, Block4KPtr}, cast, utils::FailablePageSource};
+
+use std::{marker::PhantomData, ptr::{null_mut, copy_nonoverlapping}, mem::{size_of, MaybeUninit, forget}, cell::UnsafeCell};
+use crate::{root_alloc::Block4KPtr, utils::FailablePageSource};
 
 
 // this datatype is monomorphisation-aware.
@@ -34,7 +35,7 @@ impl <T> Array<T> {
   #[must_use]
   pub fn push(&self, new_item: T, page_source: &mut dyn FailablePageSource) -> bool {
     let this = self.project_internals();
-    let ok = Array_push_impl(this, addr_of!(new_item).cast(), size_of::<T>(), page_source);
+    let ok = Array_push_impl(this, core::ptr::addr_of!(new_item).cast(), size_of::<T>(), page_source);
     if !ok { return false }
     forget(new_item);
     return true;
@@ -230,7 +231,7 @@ fn Array_pop_impl(
 
 #[test]
 fn pushespops_repsect_boundries() {
-  let mut ralloc = RootAllocator::new(false);
+  let mut ralloc = crate::root_alloc::RootAllocator::new();
   type Item = u32;
   let arr = Array::<Item>::new();
   let limit = 4096 / size_of::<Item>();
@@ -254,7 +255,8 @@ fn pushespops_repsect_boundries() {
 
 #[test]
 fn weirdly_sized_pushespops_repsect_boundries() {
-  let mut ralloc = RootAllocator::new(false);
+  use core::ptr::addr_of;
+  let mut ralloc = crate::root_alloc::RootAllocator::new();
   type Item = [u8;3];
   let arr = Array::<Item>::new();
   let page_capacity = 4096 / size_of::<Item>();
@@ -264,7 +266,7 @@ fn weirdly_sized_pushespops_repsect_boundries() {
   for i in 0 .. limit {
     let mut v = [0u8;3];
     unsafe {
-      copy_nonoverlapping(cast!(&i, *const u8), cast!(&mut v, *mut u8) , 3)
+      copy_nonoverlapping(addr_of!(i).cast::<u8>(), core::ptr::addr_of_mut!(v).cast::<u8>(), 3)
     };
     let _ = arr.push(v, &mut ralloc);
   }
@@ -279,7 +281,7 @@ fn weirdly_sized_pushespops_repsect_boundries() {
     let item = *vec.get(i).unwrap();
     let mut m = 0u32;
     unsafe {
-      copy_nonoverlapping(cast!(&item, *const u8), cast!(&mut m, *mut u8), 3)
+      copy_nonoverlapping(addr_of!(item).cast::<u8>(), core::ptr::addr_of_mut!(m).cast::<u8>(), 3)
     }
     assert!(m == i as u32);
   }
@@ -287,7 +289,7 @@ fn weirdly_sized_pushespops_repsect_boundries() {
 
 #[test]
 fn indexing_works() {
-  let mut ralloc = RootAllocator::new(false);
+  let mut ralloc = crate::root_alloc::RootAllocator::new();
   let arr = Array::<u32>::new();
   for i in 0 .. 4096 {
     let _ = arr.push(i, &mut ralloc);
@@ -323,7 +325,7 @@ impl <T> FailablePageSource for Array<T> {
 
 #[test]
 fn draining_works() { unsafe {
-  let mut ralloc = RootAllocator::new(false);
+  let mut ralloc = crate::root_alloc::RootAllocator::new();
   let arr = Array::<u64>::new();
   for i in 0 .. 512 {
     let _ = arr.push(i, &mut ralloc);
@@ -347,7 +349,7 @@ fn draining_works() { unsafe {
 
 #[test]
 fn draining_on_empty() {
-  let mut ralloc = RootAllocator::new(false);
+  let mut ralloc = crate::root_alloc::RootAllocator::new();
   let arr = Array::<u64>::new();
 
   let smth = arr.try_drain_page();
@@ -359,7 +361,7 @@ fn draining_on_empty() {
 
 #[test]
 fn inout_lots() {
-  let mut ralloc = RootAllocator::new(false);
+  let mut ralloc = crate::root_alloc::RootAllocator::new();
   let arr = Array::new();
   const LIMIT : usize = 1_000_000;
   for i in 0 .. LIMIT {

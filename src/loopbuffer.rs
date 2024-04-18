@@ -1,28 +1,37 @@
+
+
+use core::mem::align_of;
 use std::{
   mem::{MaybeUninit, size_of, forget},
   cell::UnsafeCell, ptr::{addr_of_mut, copy_nonoverlapping, addr_of}, simd::Simd
 };
 
-
+use crate::driver_async::{PackItem, TaskPack};
 
 // non-thread safe, bounded queue.
 // pushes and pops do not invalidate refs to this object.
+#[repr(C)] #[repr(align(128))] #[allow(non_upper_case_globals)]
+struct InlineLoopBufferStorageRepr<const Capacity:usize, T>([MaybeUninit<T>;Capacity]);
+
+#[allow(non_upper_case_globals)]
 pub struct InlineLoopBuffer<const Capacity:usize, T>(
-  UnsafeCell<InlineLoopBufferData<Capacity, T>>);
-struct InlineLoopBufferData<const Capacity:usize, T> {
+  UnsafeCell<InlineLoopBufferInner<Capacity, T>>);
+#[repr(C)] #[allow(non_upper_case_globals)]
+struct InlineLoopBufferInner<const Capacity:usize, T> {
+  items: InlineLoopBufferStorageRepr<Capacity, T>,
   write_index: usize,
   read_index: usize,
   item_count: usize,
-  items: [MaybeUninit<T>; Capacity],
 }
+
 trait InlineLoopBufferDataAccessorImpl {
   fn get_internals(&mut self)
     -> (*mut u8, &mut usize, &mut usize, &mut usize);
 }
-
+#[allow(non_upper_case_globals)]
 impl <const Capacity:usize, T>
   InlineLoopBufferDataAccessorImpl
-  for InlineLoopBufferData<Capacity, T> {
+  for InlineLoopBufferInner<Capacity, T> {
 
   fn get_internals(&mut self)
     -> (*mut u8, &mut usize, &mut usize, &mut usize) {
@@ -35,23 +44,26 @@ impl <const Capacity:usize, T>
     )
   }
 }
-#[allow(unused)]
+#[allow(non_upper_case_globals)]
 impl <const Capacity:usize, T> InlineLoopBuffer<Capacity, T> {
   pub fn new() -> Self { unsafe {
     Self(UnsafeCell::new(
-      InlineLoopBufferData {
+      InlineLoopBufferInner {
         items: MaybeUninit::uninit().assume_init(),
         write_index: 0,
         read_index: 0,
         item_count: 0 }))
   } }
-  pub fn insert_pack(&self, pack: Simd<u64,32>, len: u8) { unsafe {
+  pub fn insert_pack(&self, pack: TaskPack, len: usize) { unsafe {
+    assert!(Capacity * size_of::<PackItem>() >= size_of::<TaskPack>());
+    assert!(align_of::<Self>() >= align_of::<TaskPack>());
+    assert!(self.item_count() == 0);
     let this = &mut *self.0.get();
     this.read_index = 0;
-    this.write_index = if len == 16 { 0 } else { len as usize };
-    this.item_count = len as usize;
-    let ptr = this.items.as_mut_ptr().cast::<Simd<u64, 32>>();
-    ptr.write_unaligned(pack);
+    this.write_index = if len == 16 { 0 } else { len };
+    this.item_count = len ;
+    let ptr = this.items.0.as_mut_ptr().cast::<Simd<u64, 16>>();
+    ptr.write(pack.simd);
   } }
   // true if pushing was successful
   pub fn push_to_tail(&self, new_item: T) -> bool { unsafe {
@@ -80,13 +92,17 @@ impl <const Capacity:usize, T> InlineLoopBuffer<Capacity, T> {
   pub fn item_count(&self) -> usize {
     unsafe { (&*self.0.get()).item_count }
   }
+  pub fn remaining_capacity(&self) -> usize {
+    Capacity - self.item_count()
+  }
   pub fn mref_item_at_index(&self, index: usize) -> Option<&mut T> { unsafe {
     let this = &mut*self.0.get();
     if index >= this.item_count { return None }
     let mut index_ = this.read_index + index;
     if index_ >= Capacity {
-      index_ = index - (Capacity - this.read_index) }
-    let item_ref = (&mut*this.items.as_mut_ptr().add(index_)).assume_init_mut();
+      index_ = index_ - Capacity
+    }
+    let item_ref = this.items.0[index_].assume_init_mut();
     return Some(item_ref)
   }; }
 }
@@ -216,6 +232,7 @@ pub trait SomeInlineLoopBuffer {
   fn item_count(&self) -> usize;
   fn mref_item_at_index(&self, index: usize) -> Option<&mut Self::Item>;
 }
+#[allow(non_upper_case_globals)]
 impl <const Cap:usize, T>  SomeInlineLoopBuffer for InlineLoopBuffer<Cap, T> {
   type Item = T;
   fn item_count(&self) -> usize { self.item_count()}
@@ -237,7 +254,7 @@ pub struct LoopBufferTraverser<'i, T> {
   source: &'i dyn SomeInlineLoopBuffer<Item = T>,
   current_index: usize
 }
-#[allow(unused)]
+#[allow(unused)] #[allow(non_upper_case_globals)]
 impl <'i, T> LoopBufferTraverser<'i, T> {
   pub fn new<const Cap:usize>(source: &'i InlineLoopBuffer<Cap, T>) -> Self {
     Self {
@@ -291,5 +308,19 @@ fn iter_over_loop2() {
     let v = buf.pop_from_head();
     if v.is_none() { panic!() }
     assert!(v.unwrap() == i)
+  }
+}
+
+#[test]
+fn indexiing_trivial() {
+  const LIMIT : usize = 1000;
+  let buf = InlineLoopBuffer::<LIMIT, usize>::new();
+
+  for i in 0 .. LIMIT {
+    buf.push_to_tail(i);
+  }
+  for i in 0 .. LIMIT {
+    let item = buf.mref_item_at_index(i).unwrap();
+    assert!(*item == i);
   }
 }
