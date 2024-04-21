@@ -86,7 +86,7 @@ fn publish_changes_on_memory(
   bytes: usize
 ) {
   let span = bytes.next_multiple_of(64) >> 6;
-  let mut addr = start_address.expose_addr();
+  let mut addr = start_address as usize;
   for _ in 0 .. span {
     unsafe {
       core::arch::x86_64::_mm_clflush(addr as _);

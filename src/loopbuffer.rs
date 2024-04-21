@@ -99,9 +99,7 @@ impl <const Capacity:usize, T> InlineLoopBuffer<Capacity, T> {
     let this = &mut*self.0.get();
     if index >= this.item_count { return None }
     let mut index_ = this.read_index + index;
-    if index_ >= Capacity {
-      index_ = index_ - Capacity
-    }
+    index_ -= (index_ >= Capacity) as usize * Capacity;
     let item_ref = this.items.0[index_].assume_init_mut();
     return Some(item_ref)
   }; }
@@ -224,6 +222,7 @@ fn poping_from_tail() {
   assert!(two == 2)
 }
 
+#[allow(dead_code)]
 pub trait SomeInlineLoopBuffer {
   type Item ;
   fn push_to_tail(&self, new_item: Self::Item) -> bool;

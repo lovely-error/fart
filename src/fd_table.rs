@@ -1,6 +1,15 @@
-use core::{cell::UnsafeCell, mem::{forget, size_of, transmute, MaybeUninit}, ptr::{addr_of, addr_of_mut, null_mut}, sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}, time::Duration};
+use core::{cell::UnsafeCell, mem::{size_of, transmute, MaybeUninit}, ptr::{addr_of, addr_of_mut, null_mut}, sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}, time::Duration};
 
-use crate::{driver_async::TaskRef, force_pusblish_stores, futex, root_alloc::{Block4KPtr, RootAllocator}, static_assert, utils::{publish_changes_on_memory, publish_changes_on_object, FailablePageSource}};
+use crate::{driver_async::TaskRef, futex, root_alloc::{Block4KPtr, RootAllocator}, utils::{publish_changes_on_memory, FailablePageSource}};
+
+macro_rules! static_assert {
+    ($cond:expr) => {
+      const _ : () = if !$cond { std::panic!("Comptime assert failed!") } ;
+    };
+    ($cond:expr, $msg:expr) => {
+      const _ : () = if !$cond { panic!($msg) } ;
+    };
+}
 
 const MAP_LEN: usize = 4;
 
@@ -23,18 +32,12 @@ const FIRST_INVALID_IX: usize = 64 - ((8*8*MAP_LEN) - FDS_MAX);
 
 pub(crate) struct FDTable(UnsafeCell<FDReactorInner>);
 struct FDReactorInner {
-  initial_page: AtomicU64,
-  submit_available: AtomicBool,
-  ready_available: AtomicBool,
-  coarse_lock: AtomicBool,
+  first_page: AtomicU64,
 }
 impl FDTable {
   pub(crate)fn new() -> Self {
     Self(UnsafeCell::new(FDReactorInner {
-      initial_page: AtomicU64::new(0),
-      submit_available: AtomicBool::new(true),
-      ready_available: AtomicBool::new(true),
-      coarse_lock: AtomicBool::new(true)
+      first_page: AtomicU64::new(0),
     }))
   }
   fn inner(&self) -> &mut FDReactorInner {
@@ -42,32 +45,32 @@ impl FDTable {
   }
   fn is_uninit(&self) -> bool {
     let inner = self.inner();
-    inner.initial_page.load(Ordering::Relaxed) == 0
+    inner.first_page.load(Ordering::Relaxed) == 0
   }
+  #[inline(always)]
   fn setup_page(page: &Block4KPtr) {
     let ptr = page.get_ptr().cast::<Metadata>();
-    unsafe { ptr.write_bytes(0, size_of::<Metadata>()) };
-    fence(Ordering::AcqRel);
-    publish_changes_on_memory(ptr.cast(), size_of::<Metadata>());
+    unsafe { ptr.write(Metadata {
+      submit_map: MaybeUninit::zeroed(),
+      ready_map: MaybeUninit::zeroed(),
+      next_page: AtomicUsize::new(0)
+    }); }
   }
+  #[inline(always)]
   fn do_first_init(&self, page: Block4KPtr) {
     Self::setup_page(&page);
     let ptr = page.get_ptr();
-    self.inner().initial_page.store(ptr as _, Ordering::Release);
+    self.inner().first_page.store(ptr as _, Ordering::Release);
   }
+  #[inline(always)]
   fn get_page_ptr(&self) -> *mut FDPage {
-    match self.inner().initial_page.compare_exchange(0,0, Ordering::Relaxed, Ordering::Acquire) {
-      Ok(_) => return null_mut(),
-      Err(real) => return real as _,
-    }
+    self.inner().first_page.load(Ordering::Acquire) as _
   }
   #[must_use]
   pub(crate) fn tx_try_put(&self, task: TaskRef, page_source: &dyn FailablePageSource) -> bool {
     self.tx_try_put_impl(task, page_source, false)
   }
   pub(crate) fn tx_try_get(&self) -> Option<TaskRef> {
-
-    fence(Ordering::AcqRel);
     let item = self.get_page_ptr();
     if item.is_null() { return None; }
     let mut ptr = item as *mut FDPage;
@@ -87,7 +90,7 @@ impl FDTable {
 
         break 'free_slot_search (index as usize, i);
       }
-      let next = unsafe { (*ptr).mtd.next_page.load(Ordering::Relaxed) };
+      let next = unsafe { (*ptr).mtd.next_page.load(Ordering::Acquire) };
       if next == 0 { return None };
       ptr = next as _;
       segment_map_ref = unsafe { (*ptr).mtd.ready_map.assume_init_ref() };
@@ -96,9 +99,8 @@ impl FDTable {
     unsafe {
       let addr = addr_of_mut!((*ptr).ready_fds[(six * 64) + ix]);
       let val = addr.read();
-      core::arch::x86_64::_mm_lfence();
       let mask = 1 << ix;
-      let prior = segment_map_ref[six].fetch_and(!mask, Ordering::AcqRel);
+      let prior = segment_map_ref[six].fetch_and(!mask, Ordering::Release);
 
       let taken_value = prior & mask != 0;
       debug_assert!(taken_value, "Taken garbage!");
@@ -135,11 +137,8 @@ impl FDTable {
     unsafe {
       let addr = addr_of_mut!((*ptr).submit_fds[(six * 64) + ix]);
       let fd = addr.read();
-      core::arch::x86_64::_mm_lfence();
       let mask = 1 << ix;
-      let prior = segment_map_ref[six].fetch_and(!mask, Ordering::AcqRel);
-      fence(Ordering::AcqRel);
-
+      let prior = segment_map_ref[six].fetch_and(!mask, Ordering::Release);
       let taken_value = prior & mask != 0;
       debug_assert!(taken_value, "Taken garbage!");
 
@@ -179,8 +178,6 @@ impl FDTable {
       addr.write(task);
       let mask = 1 << ix;
       let prior = segment_map_ref[six].fetch_or(mask, Ordering::Release);
-      fence(Ordering::AcqRel);
-
       let untaken = mask & prior == 0;
       debug_assert!(untaken, "Impossible index collision happened!");
     }
@@ -194,7 +191,6 @@ impl FDTable {
     page_source: &dyn FailablePageSource,
     in_test_mode:bool
   ) -> bool {
-
     if self.is_uninit() {
       let page = match page_source.try_drain_page() {
         Some(page) => page,
@@ -221,14 +217,13 @@ impl FDTable {
       }
       let next = unsafe { (*ptr).mtd.next_page.load(Ordering::Acquire) };
       let next = if next == 0 {
-        unsafe {core::arch::x86_64::_mm_lfence();}
         let page = match page_source.try_drain_page() {
           Some(page) => page,
           None => return false,
         };
         Self::setup_page(&page);
         let next = page.get_ptr();
-        unsafe { (*ptr).mtd.next_page.store(next.expose_addr(), Ordering::Release) };
+        unsafe { (*ptr).mtd.next_page.store(next as usize, Ordering::Release) };
         next.cast::<FDPage>()
       } else {
         next as _
@@ -251,37 +246,6 @@ impl FDTable {
       debug_assert!(untaken, "Impossible index collision happened!")
     }
     return true;
-  }
-}
-#[allow(dead_code)]
-impl FDTable {
-  #[inline(always)]
-  pub fn try_submit_lock_aquire(&self) -> bool {
-    let inner = self.inner();
-    inner.submit_available.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed).is_ok()
-  }
-  #[inline(always)]
-  pub fn release_submit_lock(&self) {
-    let inner = self.inner();
-    inner.submit_available.store(true, Ordering::Release);
-  }
-  #[inline(always)]
-  pub fn try_ready_lock_aquire(&self) -> bool {
-    let inner = self.inner();
-    inner.ready_available.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed).is_ok()
-  }
-  #[inline(always)]
-  pub fn release_ready_lock(&self) {
-    let inner = self.inner();
-    inner.ready_available.store(true, Ordering::Release);
-  }
-  #[inline(always)]
-  fn try_aquire_coarse_lock(&self) -> bool {
-    self.inner().coarse_lock.compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed).is_ok()
-  }
-  #[inline(always)]
-  fn release_coarse_lock(&self) {
-    self.inner().coarse_lock.store(true, Ordering::SeqCst);
   }
 }
 
@@ -339,7 +303,6 @@ unsafe impl Sync for FDTable {}
 
 #[test]
 fn to_production_check() {
-  use core::sync::atomic::AtomicI32;
 
   struct Env {
     fd_table: FDTable,
@@ -405,7 +368,6 @@ fn threaded_prod_cons_check_few_times_more() {
 
 #[test] #[ignore]
 fn threaded_prod_cons_check() {
-  use core::sync::atomic::AtomicI32;
 
   struct Env {
     tx_salt: futex::Token,
@@ -424,7 +386,7 @@ fn threaded_prod_cons_check() {
 
   let env_addr2 = addr_of!(env) as u64;
 
-  const LIMIT: usize = FDS_MAX * 4;
+  const LIMIT: usize = 4;
   const SHOULD_LOG:bool = false;
 
   let rx = std::thread::spawn(move ||{
@@ -439,19 +401,15 @@ fn threaded_prod_cons_check() {
         }
       }
       fence(Ordering::AcqRel);
-      while !env.fd_table.try_aquire_coarse_lock() {}
       let smth = env.fd_table.rx_try_get();
-      env.fd_table.release_coarse_lock();
       match smth {
         Some(item) => {
           let n:u64 = unsafe{transmute(item)};
           if SHOULD_LOG {
             println!("Consumer got {}", n);
           }
-          fence(Ordering::SeqCst);
-          while !env.fd_table.try_aquire_coarse_lock() {}
+          fence(Ordering::AcqRel);
           env.fd_table.rx_put_ready(item);
-          env.fd_table.release_coarse_lock();
           fence(Ordering::AcqRel);
           futex::futex_wake(&env.tx_salt);
           if SHOULD_LOG {
@@ -481,15 +439,13 @@ fn threaded_prod_cons_check() {
   let mut log = String::new();
   fence(Ordering::AcqRel);
   loop {
-    while !env.fd_table.try_aquire_coarse_lock() {}
     let ok = env.fd_table.tx_try_put_impl(unsafe{ transmute(ix) }, &env.alloc, true);
-    env.fd_table.release_coarse_lock();
     assert!(ok);
     ix += 1;
     if SHOULD_LOG {
       writeln!(&mut log, "{}: Producer put {}", ix, ix).unwrap();
     }
-    fence(Ordering::SeqCst);
+    fence(Ordering::AcqRel);
     let awoken = futex::futex_wake(&env.rx_salt);
     if awoken && SHOULD_LOG {
       writeln!(&mut log, "{}: Producer awoken consumer", ix).unwrap();
@@ -502,10 +458,8 @@ fn threaded_prod_cons_check() {
         println!("{}: Producer found stale value", ix);
       }
     }
-    fence(Ordering::SeqCst);
-    while !env.fd_table.try_aquire_coarse_lock() {}
+    fence(Ordering::AcqRel);
     let item = env.fd_table.tx_try_get();
-    env.fd_table.release_coarse_lock();
     match item {
       Some(item) => {
         let v = unsafe{ transmute(item) };
@@ -524,7 +478,10 @@ fn threaded_prod_cons_check() {
     }
   }
 
-  fence(Ordering::SeqCst);
+  fence(Ordering::AcqRel);
+  if SHOULD_LOG {
+    println!("---\n{}", log);
+  }
 
   env.kill_rx_side.store(true, Ordering::Release);
   rx.join().unwrap();

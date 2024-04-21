@@ -32,7 +32,7 @@ struct Superpage([Page4K;SMALL_PAGE_LIMIT]);
 static_assert!(align_of::<Superpage>() == PAGE_2MB_ALIGN);
 static_assert!(size_of::<Superpage>() == PAGE_2MB_SIZE);
 
-#[repr(align(4096))]
+#[repr(align(4096))] #[allow(dead_code)]
 struct Page4K([u8;4096]);
 
 #[derive(Debug, Clone, Copy)]

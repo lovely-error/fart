@@ -1,10 +1,12 @@
-#![feature(pointer_is_aligned)]
 #![feature(strict_provenance)]
 #![feature(ptr_alignment_type)]
-#![feature(portable_simd)]
-#![feature(offset_of)]
 #![feature(generic_arg_infer)]
 #![feature(let_chains)]
+#![feature(thread_spawn_unchecked)]
+#![feature(pointer_is_aligned_to)]
+#![feature(portable_simd)]
+#![feature(negative_impls)]
+#![feature(inline_const)]
 
 #[cfg(not(target_os = "linux"))]
   compile_error!(
@@ -48,6 +50,10 @@ pub use driver_async::{
   RtRef,
 };
 
+mod pipe;
+mod block_allocator;
 
 // #[allow(unused_imports)]
-// mod fd_table;
+mod fd_table;
+
+mod cl_lock;
