@@ -38,7 +38,7 @@ mod loopbuffer;
 mod array;
 #[allow(dead_code)]
 mod futex;
-
+#[allow(dead_code)]
 mod driver_async;
 
 pub use driver_async::{
@@ -50,10 +50,12 @@ pub use driver_async::{
   RtRef,
 };
 
-mod pipe;
+// mod pipe;
+#[allow(dead_code)]
 mod block_allocator;
 
 // #[allow(unused_imports)]
-mod fd_table;
+// mod fd_table;
 
+#[allow(dead_code)]
 mod cl_lock;

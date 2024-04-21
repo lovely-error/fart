@@ -1,4 +1,4 @@
-use core::{cell::UnsafeCell, mem::{align_of, offset_of, size_of}, ptr::{addr_of_mut, null_mut}, sync::atomic::{AtomicU64, Ordering}};
+use core::{cell::UnsafeCell, mem::{align_of, offset_of, size_of}, ptr::null_mut, sync::atomic::{AtomicU64, Ordering}};
 
 use crate::{driver_async::PageSink, root_alloc::Block4KPtr, utils::FailablePageSource};
 

@@ -1,8 +1,4 @@
-use core::{cell::UnsafeCell, mem::{size_of, ManuallyDrop}, ptr::addr_of, simd::Simd, sync::atomic::{fence, AtomicU8, Ordering}};
-
-use crate::utils::publish_changes_on_object;
-
-
+use core::{cell::UnsafeCell, mem::{size_of, ManuallyDrop}, ptr::addr_of, simd::Simd, sync::atomic::{AtomicU8, Ordering}};
 
 #[repr(C)] #[repr(align(64))]
 pub struct SmallLock<T> {
