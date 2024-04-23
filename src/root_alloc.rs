@@ -2,7 +2,7 @@
 use core::{mem::{align_of, size_of}, ptr::addr_of_mut, sync::atomic::AtomicUsize};
 use std::{cell::UnsafeCell, os::raw::c_int, ptr::null_mut, sync::atomic::Ordering};
 
-use crate::utils::FailablePageSource;
+use crate::utils::PageSource;
 use libc::{
   self, MAP_ANONYMOUS, MAP_HUGETLB, MAP_HUGE_2MB, MAP_POPULATE, MAP_PRIVATE, PROT_READ, PROT_WRITE
 };
@@ -160,8 +160,8 @@ impl Block4KPtr {
   }
 }
 
-impl FailablePageSource for RootAllocator {
-    fn try_drain_page(&self) -> Option<Block4KPtr> {
+impl PageSource for RootAllocator {
+    fn try_get_page(&self) -> Option<Block4KPtr> {
       match self.try_get_page_wait_tolerable() {
         Ok(mem) => Some(mem),
         Err(err) => match err {

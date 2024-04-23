@@ -22,9 +22,11 @@ struct Metadata {
 const FDS_MAX: usize = (4096 - size_of::<Metadata>()) / (size_of::<TaskRef>() * 2);
 #[repr(C)] #[repr(align(4096))]
 struct FDPage {
-  mtd: Metadata,
+  submit_map: MaybeUninit<[AtomicU64;MAP_LEN]>,
   submit_fds: [TaskRef;FDS_MAX],
-  ready_fds: [TaskRef;FDS_MAX]
+  ready_map: MaybeUninit<[AtomicU64;MAP_LEN]>,
+  ready_fds: [TaskRef;FDS_MAX],
+  next_page: AtomicUsize,
 }
 static_assert!(size_of::<FDPage>() == 4096);
 
@@ -75,7 +77,7 @@ impl FDTable {
     if item.is_null() { return None; }
     let mut ptr = item as *mut FDPage;
     let mut segment_map_ref = unsafe {
-      (*ptr).mtd.ready_map.assume_init_ref()
+      (*ptr).ready_map.assume_init_ref()
     };
     let (ix, six) = 'free_slot_search: loop {
       'map_traverse:for i in 0 .. MAP_LEN {
@@ -90,10 +92,10 @@ impl FDTable {
 
         break 'free_slot_search (index as usize, i);
       }
-      let next = unsafe { (*ptr).mtd.next_page.load(Ordering::Acquire) };
+      let next = unsafe { (*ptr).next_page.load(Ordering::Acquire) };
       if next == 0 { return None };
       ptr = next as _;
-      segment_map_ref = unsafe { (*ptr).mtd.ready_map.assume_init_ref() };
+      segment_map_ref = unsafe { (*ptr).ready_map.assume_init_ref() };
       continue 'free_slot_search;
     };
     unsafe {
@@ -113,7 +115,7 @@ impl FDTable {
     let mut ptr = self.get_page_ptr();
     if ptr.is_null() { return None; }
     let mut segment_map_ref = unsafe {
-      (*ptr).mtd.submit_map.assume_init_ref()
+      (*ptr).submit_map.assume_init_ref()
     };
     let (ix, six) = 'free_slot_search: loop {
       'map_traverse:for i in 0 .. MAP_LEN {
@@ -128,10 +130,10 @@ impl FDTable {
 
         break 'free_slot_search (index as usize, i);
       }
-      let next = unsafe { (*ptr).mtd.next_page.load(Ordering::Acquire) };
+      let next = unsafe { (*ptr).next_page.load(Ordering::Acquire) };
       if next == 0 { return None };
       ptr = next as _;
-      segment_map_ref = unsafe { (*ptr).mtd.submit_map.assume_init_ref() };
+      segment_map_ref = unsafe { (*ptr).submit_map.assume_init_ref() };
       continue 'free_slot_search;
     };
     unsafe {
@@ -152,7 +154,7 @@ impl FDTable {
     debug_assert!(!ptr.is_null());
     let mut ptr = self.get_page_ptr();
     let mut segment_map_ref = unsafe {
-      (*ptr).mtd.ready_map.assume_init_ref()
+      (*ptr).ready_map.assume_init_ref()
     };
     let (ix, six) = 'free_slot_search: loop {
       'map_traverse:for i in 0 .. MAP_LEN {
@@ -166,10 +168,10 @@ impl FDTable {
         if reached_segment_end { continue 'map_traverse }
         break 'free_slot_search (index as usize, i);
       }
-      let next = unsafe { (*ptr).mtd.next_page.load(Ordering::Acquire) };
+      let next = unsafe { (*ptr).next_page.load(Ordering::Acquire) };
       assert!(next != 0);
       ptr = next as _;
-      segment_map_ref = unsafe { (*ptr).mtd.ready_map.assume_init_ref() };
+      segment_map_ref = unsafe { (*ptr).ready_map.assume_init_ref() };
       continue 'free_slot_search;
     };
     unsafe {
@@ -201,7 +203,7 @@ impl FDTable {
     }
     let mut ptr = self.get_page_ptr();
     let mut segment_map_ref = unsafe {
-      (*ptr).mtd.submit_map.assume_init_ref()
+      (*ptr).submit_map.assume_init_ref()
     };
     let (ix, six) = 'free_slot_search: loop {
       'map_traverse:for i in 0 .. MAP_LEN {
@@ -215,7 +217,7 @@ impl FDTable {
         if reached_segment_end { continue 'map_traverse }
         break 'free_slot_search (index as usize, i);
       }
-      let next = unsafe { (*ptr).mtd.next_page.load(Ordering::Acquire) };
+      let next = unsafe { (*ptr).next_page.load(Ordering::Acquire) };
       let next = if next == 0 {
         let page = match page_source.try_drain_page() {
           Some(page) => page,
@@ -223,13 +225,13 @@ impl FDTable {
         };
         Self::setup_page(&page);
         let next = page.get_ptr();
-        unsafe { (*ptr).mtd.next_page.store(next as usize, Ordering::Release) };
+        unsafe { (*ptr).next_page.store(next as usize, Ordering::Release) };
         next.cast::<FDPage>()
       } else {
         next as _
       };
       ptr = next;
-      segment_map_ref = unsafe { (*ptr).mtd.submit_map.assume_init_ref() };
+      segment_map_ref = unsafe { (*ptr).submit_map.assume_init_ref() };
       continue 'free_slot_search;
     };
     unsafe {
@@ -258,8 +260,8 @@ fn tx_rx_inout() {
     assert!(ok);
   }
   let p = unsafe {&*r.get_page_ptr()};
-  assert!(p.mtd.next_page.load(Ordering::Relaxed) == 0);
-  let sm = unsafe {p.mtd.submit_map.assume_init_ref()};
+  assert!(p.next_page.load(Ordering::Relaxed) == 0);
+  let sm = unsafe {p.submit_map.assume_init_ref()};
   for i in &sm[..(MAP_LEN - 1)] {
     assert!(u64::MAX == i.load(Ordering::Relaxed));
   }
@@ -268,7 +270,7 @@ fn tx_rx_inout() {
   assert!(sm[MAP_LEN - 1].load(Ordering::Relaxed) == correct_last);
   let ok = r.tx_try_put_impl(unsafe {transmute(FDS_MAX + 1)}, &mut s, true);
   assert!(ok);
-  assert!(p.mtd.next_page.load(Ordering::Relaxed) != 0);
+  assert!(p.next_page.load(Ordering::Relaxed) != 0);
   for i in 0 .. FDS_MAX  {
     let v = r.rx_try_get().unwrap();
     assert!(i == unsafe { transmute(v) } );
@@ -342,7 +344,7 @@ fn to_production_check() {
 
 #[test] #[ignore = "BECAUSE IT DOESNT FUCKING WORK"]
 fn threaded_prod_cons_check_few_times_more() {
-  let total_count = 64;
+  let total_count = 64*2;
   let mut fail_count = 0;
   for _ in 0 .. total_count {
     std::panic::set_hook(Box::new(|_|{}));
@@ -386,7 +388,7 @@ fn threaded_prod_cons_check() {
 
   let env_addr2 = addr_of!(env) as u64;
 
-  const LIMIT: usize = 4;
+  const LIMIT: usize = FDS_MAX;
   const SHOULD_LOG:bool = false;
 
   let rx = std::thread::spawn(move ||{

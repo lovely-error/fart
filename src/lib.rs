@@ -59,3 +59,5 @@ mod block_allocator;
 
 #[allow(dead_code)]
 mod cl_lock;
+
+mod virt_mem;

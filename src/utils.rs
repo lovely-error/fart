@@ -53,8 +53,8 @@ fn quick_sanity_check(){
 }
 
 
-pub trait FailablePageSource {
-  fn try_drain_page(&self) -> Option<Block4KPtr>;
+pub trait PageSource {
+  fn try_get_page(&self) -> Option<Block4KPtr>;
 }
 
 #[repr(C)]

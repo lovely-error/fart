@@ -1,7 +1,7 @@
 
 
 use std::{marker::PhantomData, ptr::{null_mut, copy_nonoverlapping}, mem::{size_of, MaybeUninit, forget}, cell::UnsafeCell};
-use crate::{root_alloc::Block4KPtr, utils::FailablePageSource};
+use crate::{root_alloc::Block4KPtr, utils::PageSource};
 
 
 // this datatype is monomorphisation-aware.
@@ -33,7 +33,7 @@ impl <T> Array<T> {
     return Some(ptr.cast::<T>())
   }
   #[must_use]
-  pub fn push(&self, new_item: T, page_source: &mut dyn FailablePageSource) -> bool {
+  pub fn push(&self, new_item: T, page_source: &mut dyn PageSource) -> bool {
     let this = self.project_internals();
     let ok = Array_push_impl(this, core::ptr::addr_of!(new_item).cast(), size_of::<T>(), page_source);
     if !ok { return false }
@@ -83,9 +83,9 @@ impl ArrayInternals {
     let off = self.slots_occupied_by_mtd(item_size);
     self.access_head = self.access_head.byte_add(off * item_size) ;
   } }
-  fn do_late_init(&mut self, item_size: usize, page_source: &mut dyn FailablePageSource) -> bool { unsafe {
+  fn do_late_init(&mut self, item_size: usize, page_source: &mut dyn PageSource) -> bool { unsafe {
     assert!(self.head_page == null_mut());
-    let page = match page_source.try_drain_page() {
+    let page = match page_source.try_get_page() {
       Some(page) => page,
       None => {
         return false;
@@ -100,8 +100,8 @@ impl ArrayInternals {
     self.put_access_head_to_first_element(item_size);
     return true;
   } }
-  fn expand_storage(&mut self, item_size: usize, page_source: &mut dyn FailablePageSource) -> bool { unsafe {
-    let page = match page_source.try_drain_page() {
+  fn expand_storage(&mut self, item_size: usize, page_source: &mut dyn PageSource) -> bool { unsafe {
+    let page = match page_source.try_get_page() {
       Some(page) => page,
       None => return false,
     };
@@ -164,7 +164,7 @@ fn Array_push_impl(
   object: &mut ArrayInternals,
   new_item_source_loc: *const u8,
   item_size: usize,
-  page_source: &mut dyn FailablePageSource,
+  page_source: &mut dyn PageSource,
 ) -> bool { unsafe {
   if object.head_page == null_mut() {
     let ok = object.do_late_init(item_size, page_source);
@@ -302,8 +302,8 @@ fn indexing_works() {
   }
 }
 
-impl <T> FailablePageSource for Array<T> {
-  fn try_drain_page(&self) -> Option<Block4KPtr> { unsafe {
+impl <T> PageSource for Array<T> {
+  fn try_get_page(&self) -> Option<Block4KPtr> { unsafe {
     let ArrayInternals { access_head, tail_page, .. } = &mut *self.0.get();
     let page_start_addr = (*access_head as usize) & !((1 << 12) - 1);
     let head_on_last_page = page_start_addr == *tail_page as _;
@@ -333,7 +333,7 @@ fn draining_works() { unsafe {
   for _ in 0 .. 512 {
     let _ = arr.pop();
   }
-  let ptr = arr.try_drain_page().unwrap().get_ptr().cast::<u8>();
+  let ptr = arr.try_get_page().unwrap().get_ptr().cast::<u8>();
   ptr.write_bytes(u8::MAX, 4096);
   for i in 0 .. 512 {
     let _ = arr.push(i, &mut ralloc);
@@ -352,11 +352,11 @@ fn draining_on_empty() {
   let mut ralloc = crate::root_alloc::RootAllocator::new();
   let arr = Array::<u64>::new();
 
-  let smth = arr.try_drain_page();
+  let smth = arr.try_get_page();
   if let Some(_) = smth { panic!() }
 
   let _ = arr.push(1, &mut ralloc);
-  if let Some(_) = arr.try_drain_page(){ panic!()};
+  if let Some(_) = arr.try_get_page(){ panic!()};
 }
 
 #[test]

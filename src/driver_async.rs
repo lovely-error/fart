@@ -4,20 +4,13 @@ use core::{
   any::Any, future::Future, mem::{offset_of, size_of_val}, panic::UnwindSafe, sync::atomic::{fence, AtomicI32, AtomicU32}, task::Poll, time::Duration
 };
 use std::{
-  alloc::Layout,
-  cell::UnsafeCell,
-  mem::{
+  alloc::Layout, cell::UnsafeCell, mem::{
     align_of, forget, size_of, transmute, MaybeUninit
-  },
-  os::fd::{AsFd, AsRawFd},
-  ptr::{addr_of, addr_of_mut, null_mut },
-  simd::Simd,
-  sync::{atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering }, mpsc::{Receiver, Sender}},
-  thread::{self, spawn, JoinHandle},
+  }, os::fd::{AsFd, AsRawFd}, ptr::{addr_of, addr_of_mut, null_mut }, simd::Simd, sync::{atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering }, mpsc::{Receiver, Sender}}, thread::{self, spawn, JoinHandle}
 };
 
 use crate::{
-  block_allocator::MBAlloc, loopbuffer::InlineLoopBuffer, root_alloc::{Block4KPtr, RootAllocator}, utils::FailablePageSource
+  block_allocator::MBAlloc, loopbuffer::InlineLoopBuffer, root_alloc::{Block4KPtr, RootAllocator}, utils::PageSource, virt_mem::VirtMem
 };
 use crate::futex;
 
@@ -49,11 +42,8 @@ macro_rules! static_assert {
 
 const SMALL_PAGE_SIZE : usize = 4096;
 
-const MAX_WAIT_TIME: Duration = Duration::from_millis(16);
+const MAX_WAIT_TIME: Duration = Duration::from_millis(67);
 
-pub struct RegionMetadata {
-  ref_count: AtomicU16
-}
 #[repr(align(64))] #[allow(dead_code)]
 struct CLCell([u8;64]);
 #[repr(C)] #[repr(align(4096))]
@@ -70,10 +60,11 @@ struct TaskAllocatorInner {
 }
 pub struct TaskAllocator(UnsafeCell<TaskAllocatorInner>);
 impl TaskAllocator {
+  const MAX_ALLOC_SIZE_IN_BYTES: usize = SMALL_PAGE_SIZE - 4;
   fn new() -> Self {
     Self(UnsafeCell::new(TaskAllocatorInner {
-        page_origin_addr: null_mut(),
-        free_slab_ptr: null_mut(),
+      page_origin_addr: null_mut(),
+      free_slab_ptr: null_mut(),
     }))
   }
   fn destroy(self) -> Option<Block4KPtr> { unsafe {
@@ -90,71 +81,20 @@ impl TaskAllocator {
   fn set_page(&self, page: *mut u8) { unsafe {
     let this = &mut *self.0.get();
     let page = page.cast::<SlabPage>();
-    (*page).ref_count.store(1, Ordering::Release);
     this.page_origin_addr = page.cast();
     this.free_slab_ptr = page.byte_add(core::mem::offset_of!(SlabPage, cells)).cast();
+    (*page).ref_count.store(1, Ordering::Release);
   } }
   fn release_page(&self) -> bool { unsafe {
     let this = &mut *self.0.get() ;
-    let prior = (*this.page_origin_addr).ref_count.fetch_sub(1, Ordering::Release);
+    let prior = (*this.page_origin_addr).ref_count.fetch_sub(1, Ordering::AcqRel);
     if prior == 1 {
       // reusable
       this.free_slab_ptr = addr_of_mut!((*this.page_origin_addr).cells).cast();
+      (*this.page_origin_addr).ref_count.store(1, Ordering::Release);
       return false;
     } else {
       return true
-    }
-  } }
-  #[inline(never)] #[allow(dead_code)]
-  fn alloc_bytes(
-    &self,
-    size: usize,
-    alignment: usize,
-    page_source: &dyn FailablePageSource
-  ) -> Option<*mut ()> { unsafe {
-    if size > SLAB_MAX_COUNT * 64 { panic!("fixme: too big") }
-    let this = &mut *self.0.get();
-    if this.free_slab_ptr.is_null() {
-      let page = match page_source.try_drain_page() {
-        Some(page) => page,
-        None => return None,
-      };
-      self.set_page(page.get_ptr())
-    }
-    loop {
-      let ptr_al_off = this.free_slab_ptr.align_offset(alignment);
-      let data_ptr = this.free_slab_ptr.byte_add(ptr_al_off);
-      let end_ptr = data_ptr.byte_add(size);
-      let right_bound = this.page_origin_addr as usize + 4096;
-      let past_boundry = end_ptr as usize > right_bound;
-      if past_boundry {
-        // first release current page!
-        let needs_new = self.release_page();
-        if needs_new {
-          let page = page_source.try_drain_page();
-          let page = match page {
-              Some(page) => page,
-              None => {
-                this.free_slab_ptr = null_mut();
-                return None;
-              },
-          };
-          self.set_page(page.get_ptr().cast());
-        }
-        continue;
-      }
-      (*this.page_origin_addr).ref_count.fetch_add(1, Ordering::AcqRel);
-      let postfix = end_ptr.byte_add(end_ptr.align_offset(64));
-      let exhausted = postfix as usize == right_bound;
-      if exhausted {
-        let needs_new = self.release_page();
-        if needs_new {
-          this.free_slab_ptr = null_mut();
-        }
-      } else {
-        this.free_slab_ptr = postfix;
-      }
-      return Some(data_ptr.cast());
     }
   } }
   #[inline(never)]
@@ -164,20 +104,19 @@ impl TaskAllocator {
     header_align: u32,
     env_size: u32,
     env_align: u32,
-    page_source: &dyn FailablePageSource,
+    page_source: &dyn PageSource,
   ) -> Option<*mut ()> { unsafe {
     let this = &mut *self.0.get();
     if this.free_slab_ptr.is_null() {
-      let page = match page_source.try_drain_page() {
+      let page = match page_source.try_get_page() {
         Some(page) => page,
         None => return None,
       };
       self.set_page(page.get_ptr())
     }
     let frame_size = header_size.next_multiple_of(env_align) + env_size;
-    if frame_size > SMALL_PAGE_SIZE as u32 - 64 {
-      panic!("fixme: wont fit")
-    }
+    let fits = frame_size as usize <= Self::MAX_ALLOC_SIZE_IN_BYTES;
+    debug_assert!(fits);
 
     loop {
       let initial_addr = this.free_slab_ptr as usize;
@@ -191,7 +130,7 @@ impl TaskAllocator {
       if past_boundry {
         let needs_new = self.release_page();
         if needs_new {
-          let page = page_source.try_drain_page();
+          let page = page_source.try_get_page();
           let page = match page {
               Some(page) => page,
               None => {
@@ -230,6 +169,9 @@ impl TaskAllocator {
   } }
 }
 
+pub struct RegionMetadata {
+  ref_count: AtomicU16
+}
 pub trait DisposableMemoryObject {
   fn get_region_metadata_ptr(&self) -> *mut RegionMetadata;
 }
@@ -563,10 +505,10 @@ impl TaskList {
   fn enque_one(
     &mut self,
     task: TaskRef,
-    provider: &dyn FailablePageSource
+    provider: &dyn PageSource
   ) -> bool { unsafe {
     if self.read_ptr.is_null() {
-      let page = provider.try_drain_page();
+      let page = provider.try_get_page();
       let page = match page {
         Some(page) => page,
         None => return false,
@@ -583,7 +525,7 @@ impl TaskList {
       let cur_w = write_ptr.byte_sub(SMALL_PAGE_SIZE).cast::<TaskListPage>();
       let next_page = (*cur_w).mtd.next_page;
       if next_page.is_null() {
-        let new = provider.try_drain_page();
+        let new = provider.try_get_page();
         let new = match new {
           Some(new) => new,
           None => return false,
@@ -777,7 +719,7 @@ impl TaskSet {
     self.task_list.remaining_capacity()
   }
   #[must_use]
-  pub fn enque(&mut self, new_item: TaskRef, ps: &dyn FailablePageSource) -> bool {
+  pub fn enque(&mut self, new_item: TaskRef, ps: &dyn PageSource) -> bool {
     let ok = self.task_list.enque_one(new_item, ps);
     if ok {
       return true;
@@ -963,7 +905,7 @@ impl InitToken {
 
 enum InterworkerMessage {
   Memory(Block4KPtr),
-  Pack(TaskPack, usize)
+  Pack([PackItem;16], usize)
 }
 
 #[repr(C)]
@@ -1116,28 +1058,32 @@ impl MemRouter {
   }
   fn try_provision_mem(&self) -> bool { unsafe {
     let inner = self.inner();
-    if (*inner.page_store).has_mem() {
+    if (*inner.page_store).available_page_count() > 0 {
       return true;
     }
-    if let Some(page) = (*inner.root_allocator).try_drain_page() {
+    if let Some(page) = (*inner.root_allocator).try_get_page() {
       (*inner.page_store).store_page(page);
       return true;
     }
     return false;
   } }
+  fn available_page_count(&self) -> usize {
+    let inner = self.inner();
+    unsafe { (*inner.page_store).available_page_count() }
+  }
 }
 impl PageSink for MemRouter {
   fn recycle_page(&self, page: Block4KPtr) {
     unsafe { (*self.inner().page_store).store_page(page) }
   }
 }
-impl FailablePageSource for MemRouter {
-  fn try_drain_page(&self) -> Option<Block4KPtr> { unsafe {
+impl PageSource for MemRouter {
+  fn try_get_page(&self) -> Option<Block4KPtr> { unsafe {
     let inner = self.inner();
-    if let Some(page) = (*inner.page_store).try_drain_page() {
+    if let Some(page) = (*inner.page_store).try_get_page() {
       return Some(page);
     }
-    if let Some(page) = (*inner.root_allocator).try_drain_page() {
+    if let Some(page) = (*inner.root_allocator).try_get_page() {
       return Some(page);
     }
     return None;
@@ -1151,20 +1097,23 @@ struct FreePageList {
 }
 struct PageStorageInner {
   free_pages: *mut FreePageList,
+  page_count: usize
 }
 pub struct PageStorage(UnsafeCell<PageStorageInner>);
 impl PageStorage {
   pub fn new() -> Self {
     Self(UnsafeCell::new(PageStorageInner {
       free_pages: null_mut(),
+      page_count: 0
     }))
   }
-  fn has_mem(&self) -> bool {
+  fn available_page_count(&self) -> usize {
     let this = unsafe{&mut*self.0.get()};
-    this.free_pages != null_mut()
+    this.page_count
   }
   fn store_page(&self, page:Block4KPtr) { unsafe {
     let this = &mut*self.0.get();
+    this.page_count += 1;
     let page = page.get_ptr().cast::<FreePageList>();
     (*page).next_page = null_mut();
     if !this.free_pages.is_null() {
@@ -1192,8 +1141,8 @@ impl PageStorage {
     }
   } }
 }
-impl FailablePageSource for PageStorage {
-  fn try_drain_page(&self) -> Option<Block4KPtr> {
+impl PageSource for PageStorage {
+  fn try_get_page(&self) -> Option<Block4KPtr> {
     self.try_get_page()
   }
 }
@@ -1223,6 +1172,7 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
     this_worker.get_root_allocator(),
     &page_store
   );
+  let virt_mem = VirtMem::new();
   let mut task_set = TaskSet::new();
   let mut current_task : TaskRef = TaskRef::new_null();
 
@@ -1288,7 +1238,8 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
     current_task: addr_of!(current_task),
     fd_sink: addr_of!(tx_fd_in),
     mem_router: addr_of!(mem_controller),
-    mballoc: addr_of!(mballoc)
+    mballoc: addr_of!(mballoc),
+    virt_mem: addr_of!(virt_mem)
   }));
 
   this_worker.atomics.init_code.store(0, Ordering::Release);
@@ -1318,7 +1269,8 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
                 mem_controller.recycle_page(mem);
                 continue;
               },
-              InterworkerMessage::Pack(pack, len) => {
+              InterworkerMessage::Pack(tasks, len) => {
+                let pack = TaskPack { tasks: tasks };
                 task_set.insert_pack(pack, len);
                 continue 'dispatch;
               },
@@ -1373,7 +1325,7 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
           exec_state = ExecState::Shutdown;
           continue 'dispatch;
         }
-        if page_store.has_mem() {
+        if page_store.available_page_count() > 0 {
           give_away_mem(&page_store, workgroup);
           exec_state = ExecState::Fetch;
           continue 'dispatch;
@@ -1405,10 +1357,16 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
                 exec_state = ExecState::Fetch;
                 continue 'dispatch;
               },
-              TaskFrameType::Independent => {
+              TaskFrameType::IndependentTA => {
                 if let Some(page) = TaskAllocator::dispose(current_task) {
                   mem_controller.recycle_page(page)
                 };
+                exec_state = ExecState::Fetch;
+                continue 'dispatch;
+              },
+              TaskFrameType::IndependentVM => {
+                let ptr = current_task.get_middle_ptr();
+                VirtMem::release_memory(ptr);
                 exec_state = ExecState::Fetch;
                 continue 'dispatch;
               },
@@ -1488,7 +1446,7 @@ fn try_transfer_excess(
       tasks[i].publish_backing_memory_changes();
     }
     fence(Ordering::AcqRel);
-    while free_worker.tx_port.send(InterworkerMessage::Pack(pack, len)).is_err() {}
+    while free_worker.tx_port.send(InterworkerMessage::Pack(pack.tasks, len)).is_err() {}
     token.signal_init_release();
     fence(Ordering::AcqRel);
     free_worker.wakeup();
@@ -1499,7 +1457,7 @@ fn give_away_mem(
   page_source: &PageStorage,
   rt: &FaRT
 ) {
-  debug_assert!(page_source.has_mem());
+  debug_assert!(page_source.available_page_count() > 0);
   let workset = &rt.worker_set;
   for ix in 0 .. workset.inner().total_worker_count {
     let worker = workset.get_worker_at_index(ix as _);
@@ -1512,7 +1470,8 @@ fn give_away_mem(
         return;
       },
     };
-    while worker.tx_port.send(InterworkerMessage::Memory(page)).is_err() {}
+    let res = worker.tx_port.send(InterworkerMessage::Memory(page));
+    assert!(res.is_ok());
     fence(Ordering::AcqRel);
     worker.wakeup();
   }
@@ -1531,7 +1490,8 @@ pub struct TaskContextInternals {
   pub task_set: *mut TaskSet,
   pub task_dependency_info: TaskDependency,
   pub fd_sink: *const std::sync::mpsc::Sender<TaskRef>,
-  pub mballoc: *const MBAlloc
+  pub mballoc: *const MBAlloc,
+  pub virt_mem: *const VirtMem
 }
 impl TaskCtx {
   pub fn inner(&self) -> &mut TaskContextInternals {
@@ -1555,27 +1515,34 @@ impl UnwindSafe for TaskCtx {}
 #[derive(Debug, Clone, Copy, PartialEq)] #[repr(u8)]
 enum TaskFrameType {
   ThreadResumer,
-  Independent
+  IndependentTA,
+  IndependentVM
 }
 pub(crate) trait ValidTaskHeaderMarker {}
 
+#[repr(u8)]
+enum FrameAllocationType {
+  FromTaskFrameAllocator, FromVM
+}
 
 #[repr(C)] #[repr(align(8))] #[derive(Debug, Clone, Copy)]
 pub(crate) struct TaskRef(u64);
 impl TaskRef {
   fn new(
     task_frame_ptr: *mut (),
-    frame_type: TaskFrameType
+    frame_type: TaskFrameType,
   ) -> Self {
+
     let fr_type = (unsafe {transmute::<_, u8>(frame_type) as u64}) << 48;
     let addr = task_frame_ptr as usize as u64;
-    let comb = addr | fr_type;
+    let comb = fr_type | addr;
     return Self(comb);
   }
+
   #[inline(always)]
   pub(crate) fn publish_backing_memory_changes(&self) {
-    let mut cl_ptr = self.get_ptr().map_addr(|a|a & !((1 << 6) - 1)).cast::<CLCell>();
-    let span = (*self.get_frame_size_ref() + (64-1)) >> 6;
+    let mut cl_ptr = self.get_middle_ptr().map_addr(|a|a & !((1 << 6) - 1)).cast::<CLCell>();
+    let span = (self.get_frame_byte_size() + (64-1)) >> 6;
     for _ in 0 .. span {
       unsafe {
         core::arch::x86_64::_mm_clflush(cl_ptr.cast());
@@ -1585,7 +1552,7 @@ impl TaskRef {
   }
   #[inline(always)]
   pub(crate) fn publish_header_updates(&self) {
-    let cl_ptr = self.get_ptr().map_addr(|a|a & !((1 << 6) - 1)).cast::<CLCell>();
+    let cl_ptr = self.get_middle_ptr().map_addr(|a|a & !((1 << 6) - 1)).cast::<CLCell>();
     unsafe {core::arch::x86_64::_mm_clflush(cl_ptr.cast());}
   }
   #[inline]
@@ -1593,12 +1560,12 @@ impl TaskRef {
     unsafe {transmute((self.0 >> 48) as u8)}
   }
   #[inline]
-  fn get_ptr(&self) -> *mut () {
+  fn get_middle_ptr(&self) -> *mut () {
     (self.0 & ((1 << 48) - 1)) as _
   }
   #[inline]
   fn get_data_ptr(&self) -> *mut () {
-    self.get_ptr()
+    self.get_middle_ptr()
   }
   #[inline]
   fn get_polling_fun(&self) -> fn (*mut (), *mut()) -> core::task::Poll<()> {
@@ -1606,9 +1573,9 @@ impl TaskRef {
     mtd.poll_fun
   }
   #[inline]
-  fn get_frame_size_ref(&self) -> &mut u32 {
+  fn get_frame_byte_size(&self) -> u32 {
     let mtd = self.get_mtd_ref::<TaskHeader_AnyHeader>();
-    &mut mtd.frame_byte_size
+    mtd.frame_size_data
   }
   #[inline]
   pub(crate) fn get_mtd_ref<T:ValidTaskHeaderMarker>(&self) -> &mut T {
@@ -1637,9 +1604,7 @@ impl TaskRef {
     let ok = self.get_mtd_ref::<TaskHeader_AnyHeader>().is_owned.compare_exchange(
       true, false, Ordering::Release, Ordering::Relaxed
     ).is_ok();
-    if !ok {
-      panic!("For some reason cant release an owned task");
-    }
+    assert!(ok, "For some reason cant release an owned task");
   }
 }
 impl DisposableMemoryObject for TaskRef {
@@ -1709,6 +1674,7 @@ impl FaRT {
     assert!(size_ok, "CPU cache line size is too small.");
   }
   #[allow(dead_code)]
+  #[inline(always)]
   pub fn new_with_thread_count(
     worker_count:usize
   ) -> RtRef {
@@ -1716,6 +1682,7 @@ impl FaRT {
     let ai = AffinityInfo::new().unwrap();
     return Self::new_common_impl(worker_count,ai);
   }
+  #[inline(always)]
   pub fn new() -> RtRef {
     Self::check_hardware();
     let ai = AffinityInfo::new().unwrap();
@@ -1836,7 +1803,7 @@ impl RtRef {
       [0;_],
       TaskHeader_ThreadResumer {
         wake_mtd: addr_of_mut!(resume_mtd),
-        frame_byte_size: size as u32,
+        frame_size_data: size as u32,
         poll_fun: poll_fun,
         ext: Ext { uninit: () },
         ext2: Ext2 { uninit: () },
@@ -1851,7 +1818,7 @@ impl RtRef {
       simd: Simd::splat(0)
     };
     item.tasks[0] = task_ref;
-    while worker.tx_port.send(InterworkerMessage::Pack(item, 1)).is_err() {};
+    while worker.tx_port.send(InterworkerMessage::Pack(item.tasks, 1)).is_err() {};
     fence(Ordering::AcqRel);
     token.signal_init_release();
     worker.wakeup();
@@ -1914,7 +1881,7 @@ pub(crate) union Ext2 {
 pub(crate) struct TaskHeader_AnyHeader {
   is_owned: AtomicBool,
   ext2: Ext2,
-  frame_byte_size: u32,
+  frame_size_data: u32,
   ext: Ext,
   poll_fun: fn (*mut (), *mut ()) -> core::task::Poll<()>
 }
@@ -1928,12 +1895,12 @@ struct TaskHeader_ThreadResumer {
   wake_mtd: *mut ResumeMtd,
   is_owned: AtomicBool,
   ext2: Ext2,
-  frame_byte_size: u32,
+  frame_size_data: u32,
   ext: Ext,
   poll_fun: fn (*mut (), *mut ()) -> core::task::Poll<()>
 }
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, poll_fun);
-check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, frame_byte_size);
+check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, frame_size_data);
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, ext);
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, ext2);
 
@@ -1941,12 +1908,12 @@ check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, ext2);
 struct TaskHeader_Independent {
   is_owned: AtomicBool,
   ext2: Ext2,
-  frame_byte_size: u32,
+  frame_size_data: u32,
   ext: Ext,
   poll_fun: fn (*mut (), *mut ()) -> core::task::Poll<()>
 }
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_Independent, poll_fun);
-check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_Independent, frame_byte_size);
+check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_Independent, frame_size_data);
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_Independent, ext);
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_Independent, ext2);
 
@@ -1979,19 +1946,40 @@ pub fn launch_detached<F>(operation: F) -> impl Future<Output = ()> where F:Futu
     let task_set = &mut *(*inner).task_set;
     let free_slot_count = task_set.remaining_capacity();
     if task_to_dispatch.is_none() {
-      let _ = pm.try_provision_mem();
-      let outcome = (*inner.allocator).alloc_task_frame(
-        size_of::<TaskHeader_Independent>() as _,
-        align_of::<TaskHeader_Independent>() as _,
-        size_of::<F>() as _,
-        align_of::<F>() as _,
-        pm
-      );
-      let frame_ref = if let Some(frame) = outcome { frame } else {
-        ctx.write_task_dependency(TaskDependency::Reschedule);
-        return Poll::Pending;
+      let size = size_of::<F>();
+      let allocated_task = match size {
+        ..=TaskAllocator::MAX_ALLOC_SIZE_IN_BYTES => {
+          let outcome = (*inner.allocator).alloc_task_frame(
+            size_of::<TaskHeader_Independent>() as _,
+            align_of::<TaskHeader_Independent>() as _,
+            size_of::<F>() as _,
+            align_of::<F>() as _,
+            pm
+          );
+          let frame_ref = if let Some(frame) = outcome { frame } else {
+            // aint got mem (in the system)
+            ctx.write_task_dependency(TaskDependency::Reschedule);
+            return Poll::Pending;
+          };
+          TaskRef::new(frame_ref, TaskFrameType::IndependentTA)
+        },
+        ..=VirtMem::MAX_ALLOC_SIZE_IN_BYTES => {
+          let required_page_count = (size_of::<F>() + 4095) / 4096;
+          let available_page_count = (*inner.mem_router).available_page_count();
+          if required_page_count > available_page_count {
+            // no mem
+            // todo: park tasks that need memory instead of
+            // rescheduling them
+            ctx.write_task_dependency(TaskDependency::Reschedule);
+            return Poll::Pending;
+          }
+          let vm_range = (*inner.virt_mem).alloc_page_space(required_page_count).unwrap();
+          let ptr = vm_range.fill(&*inner.mem_router);
+          TaskRef::new(ptr, TaskFrameType::IndependentVM)
+        },
+        _ => todo!("frame size can be at most 128MiB, given was {} bytes", size_of::<F>())
       };
-      let subtask = TaskRef::new(frame_ref, TaskFrameType::Independent);
+      let subtask = allocated_task;
       subtask.get_data_ptr().cast::<F>().write(oper.assume_init_read());
       let ptr = subtask.get_mtd_ptr::<TaskHeader_Independent>();
       let pfn = transmute::<_, SomePollFun>(F::poll as *mut ());
@@ -1999,7 +1987,7 @@ pub fn launch_detached<F>(operation: F) -> impl Future<Output = ()> where F:Futu
         size_of::<TaskHeader_Independent>()
         .next_multiple_of(align_of::<F>()) + size_of::<F>();
       ptr.write(TaskHeader_Independent {
-        frame_byte_size: frame_size as u32,
+        frame_size_data: frame_size as u32,
         poll_fun: pfn,
         ext: Ext { uninit: () },
         ext2: Ext2 { uninit: () },
@@ -2117,6 +2105,159 @@ pub fn yield_now() -> impl Future<Output = ()> {
   })
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum TimerCreationFailure {
+  ResourceExhaustion, InvalidPeriodTime
+}
+#[derive(Debug, Clone, Copy)]
+pub enum TimerPeriodResetFailure {
+  InvalidPeriodTime
+}
+
+pub struct PeriodicAlarm {
+  timer_spec: libc::itimerspec,
+  fd: i32,
+  is_paused: bool, was_started: bool
+}
+impl PeriodicAlarm {
+  pub fn new_periodic(
+    fire_period: Duration
+  ) -> Result<Self, TimerCreationFailure> { unsafe {
+    const LIMIT: u128 = 999_999_999;
+    let ns_time = fire_period.as_nanos();
+    let s_time_period = ns_time / LIMIT;
+    let ns_time_period =
+      if s_time_period == 0 { ns_time }
+      else { ns_time - (LIMIT * s_time_period)  };
+    if ns_time_period > LIMIT || ns_time_period == 0 {
+      return Err(TimerCreationFailure::InvalidPeriodTime);
+    }
+    let errno_loc = libc::__errno_location();
+    let timer_fd = libc::timerfd_create(libc::CLOCK_REALTIME, libc::TFD_NONBLOCK);
+    if timer_fd == -1 {
+      let err_code = *errno_loc;
+      match err_code {
+        libc::ENOMEM |
+        libc::ENFILE |
+        libc::EMFILE => return Err(TimerCreationFailure::ResourceExhaustion),
+        libc::ENODEV |
+        libc::EPERM |
+        libc::EINVAL | _ => unreachable!("createfd_timer unexpectedly failed with errcode {}", err_code)
+      }
+    }
+    let ns_time_period = ns_time_period as i64;
+    let s_time_period = s_time_period as i64;
+    let timer_spec = libc::itimerspec {
+      it_interval: libc::timespec {
+        tv_sec: s_time_period,
+        tv_nsec: ns_time_period,
+      },
+      it_value: libc::timespec {
+        tv_sec: s_time_period,
+        tv_nsec: ns_time_period,
+      },
+    };
+
+    let timer = Self {
+      timer_spec,
+      fd: timer_fd,
+      is_paused: false,
+      was_started: false
+    };
+    return Ok(timer);
+  } }
+  pub fn set_new_period(&mut self, new_period: Duration) -> Result<(), TimerPeriodResetFailure>{ unsafe {
+    const LIMIT: u128 = 999_999_999;
+    let ns_time = new_period.as_nanos();
+    let s_time_period = ns_time / LIMIT;
+    let ns_time_period =
+      if s_time_period == 0 { ns_time }
+      else { ns_time - (LIMIT * s_time_period)  };
+    if ns_time_period > LIMIT || ns_time_period == 0 {
+      return Err(TimerPeriodResetFailure::InvalidPeriodTime);
+    }
+    let ns_time_period = ns_time_period as i64;
+    let s_time_period = s_time_period as i64;
+    let new_timer_spec = libc::itimerspec {
+      it_interval: libc::timespec {
+        tv_sec: s_time_period,
+        tv_nsec: ns_time_period,
+      },
+      it_value: libc::timespec {
+        tv_sec: s_time_period,
+        tv_nsec: ns_time_period,
+      },
+    };
+    let ret_val = libc::timerfd_settime(self.fd, 0, &new_timer_spec, &mut self.timer_spec);
+    assert!(ret_val == 0, "timerfd_settime with code {}", *libc::__errno_location());
+    self.timer_spec = new_timer_spec;
+    return Ok(());
+  } }
+  pub fn is_paused(&self) -> bool {
+    self.is_paused
+  }
+  pub fn start(&self) { unsafe {
+    let ret_val = libc::timerfd_settime(self.fd, 0, &self.timer_spec, null_mut());
+    assert!(ret_val == 0, "timerfd_settime with code {}", *libc::__errno_location());
+  } }
+  pub fn pause(&self) { unsafe {
+    let mut old = self.timer_spec;
+    let timer_spec = libc::itimerspec {
+      it_interval: libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+      },
+      it_value: libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+      },
+    };
+    let ret_val = libc::timerfd_settime(self.fd, 0, &timer_spec, &mut old);
+    assert!(ret_val == 0);
+  } }
+  pub fn resume(&self) {
+    let mut crap = MaybeUninit::<libc::itimerspec>::uninit();
+    let ret_val = unsafe {
+      libc::timerfd_settime(self.fd, 0, &self.timer_spec, crap.as_mut_ptr())
+    };
+    assert!(ret_val == 0);
+  }
+  pub fn cancel(self) { unsafe {
+    loop {
+      let ret_val = libc::close(self.fd) ;
+      if ret_val != 0 {
+        let err_code = *libc::__errno_location();
+        match err_code {
+          libc::EINTR => continue,
+          _ => unreachable!("close failed unexpectedly with error code {}", err_code)
+        }
+      }
+      break;
+    }
+  } }
+}
+impl Drop for PeriodicAlarm {
+    fn drop(&mut self) { unsafe {
+      loop {
+        let ret_val = libc::close(self.fd) ;
+        if ret_val != 0 {
+          let err_code = *libc::__errno_location();
+          match err_code {
+            libc::EINTR => continue,
+            _ => unreachable!("close failed unexpectedly with error code {}", err_code)
+          }
+        }
+        break;
+      }
+    } }
+}
+impl AsFd for PeriodicAlarm {
+  fn as_fd(&self) -> std::os::unix::prelude::BorrowedFd<'_> {
+    unsafe { std::os::unix::prelude::BorrowedFd::borrow_raw(self.fd) }
+  }
+}
+
+
 #[test]
 fn t() {
 
@@ -2177,6 +2318,21 @@ fn autodestruction() {
 }
 
 #[test]
+fn large_frame_alloc() {
+  use std::{fs::File, io::Read} ;
+  let rt = FaRT::new();
+  rt.run_to_completion(async {
+    launch_detached(async {
+      let mut f = File::open("/dev/urandom").unwrap();
+      let mut b = [0u8;4096];
+      let count = f.read(&mut b).unwrap();
+      println!("read {} bytes\n{:#?}", count, b);
+
+    }).await;
+  }).unwrap();
+}
+
+#[test]
 fn sock() {
 
   let rt = FaRT::new();
@@ -2199,7 +2355,32 @@ fn sock() {
     }
   }).unwrap();
 
-  async fn process_incoming(_: std::net::TcpStream) {
+  async fn process_incoming(stream: std::net::TcpStream) {
+    let stream = stream;
+    stream.set_nonblocking(true).unwrap();
+
+    wait_on_fd(&stream, FdInterest::Read).await;
+
+
     println!("Pise4ka!")
   }
+}
+
+
+#[test] #[ignore]
+fn timer_test() {
+  let rt = FaRT::new();
+  rt.run_to_completion(async {
+    let mut alarm = PeriodicAlarm::new_periodic(Duration::from_secs(2)).unwrap();
+    alarm.start();
+    alarm.pause();
+    alarm.resume();
+    let start = std::time::Instant::now();
+    println!("began waiting on the thing");
+    wait_on_fd(&alarm, FdInterest::Read).await;
+    println!("waiting finished. Spent {:?}", start.elapsed());
+    alarm.set_new_period(Duration::from_secs(5)).unwrap();
+    wait_on_fd(&alarm, FdInterest::Read).await;
+    println!("waiting finished. Spent {:?}", start.elapsed());
+  }).unwrap();
 }
