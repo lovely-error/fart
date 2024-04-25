@@ -1,12 +1,26 @@
 
 
 use core::{
-  any::Any, future::Future, mem::{offset_of, size_of_val}, panic::UnwindSafe, sync::atomic::{fence, AtomicI32, AtomicU32}, task::Poll, time::Duration
+  any::Any,
+  future::Future,
+  mem::{offset_of, size_of_val},
+  panic::UnwindSafe,
+  sync::atomic::{fence, AtomicI32, AtomicU32},
+  task::Poll,
+  time::Duration,
+  simd::Simd,
+  ptr::{addr_of, addr_of_mut, null_mut },
+  mem::{
+    align_of, forget, size_of, transmute, MaybeUninit
+  },
+  cell::UnsafeCell,
+  alloc::Layout,
+  sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering },
 };
 use std::{
-  alloc::Layout, cell::UnsafeCell, mem::{
-    align_of, forget, size_of, transmute, MaybeUninit
-  }, os::fd::{AsFd, AsRawFd}, ptr::{addr_of, addr_of_mut, null_mut }, simd::Simd, sync::{atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering }, mpsc::{Receiver, Sender}}, thread::{self, spawn, JoinHandle}
+  os::fd::{AsFd, AsRawFd},
+  sync::mpsc::{Receiver, Sender},
+  thread::{self, JoinHandle}
 };
 
 use crate::{
@@ -176,203 +190,6 @@ pub trait DisposableMemoryObject {
   fn get_region_metadata_ptr(&self) -> *mut RegionMetadata;
 }
 
-struct FDWorker {
-  parent: *mut Worker,
-  handle: Option<JoinHandle<()>>,
-  fd_in: std::sync::mpsc::Receiver<TaskRef>,
-  fd_out: std::sync::mpsc::Sender<TaskRef>,
-  parent_asked_to_stop: AtomicBool,
-  ping_fd: i32,
-  init_code: AtomicI32,
-  salt: futex::Token
-}
-impl FDWorker {
-  #[must_use]
-  fn try_start(&mut self) -> Result<(), i32> { unsafe {
-    if let Some(_) = self.handle { return Ok(()) }
-    let this = addr_of_mut!(*self) as u64;
-    let thread = spawn(move || {
-      let this = this as *mut FDWorker;
-      io_polling_routine(&mut*this)
-    });
-    loop {
-      match self.init_code.compare_exchange(0, 0, Ordering::Relaxed, Ordering::Relaxed) {
-        Ok(_) => {
-          self.handle = Some(thread);
-          return Ok(());
-        },
-        Err(real) => {
-          if real == -1 { continue }
-          drop(thread);
-          return Err(real);
-        },
-      };
-    }
-  } }
-  fn stop(&mut self) {
-    if let Some(thread) = self.handle.take() {
-      match self.parent_asked_to_stop.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed) {
-        Ok(_) => (),
-        Err(_) => unreachable!(),
-      };
-      self.wakeup();
-      thread.join().unwrap();
-    }
-  }
-  #[inline(always)]
-  fn wakeup(&self) {
-    let _ = futex::futex_wake(&self.salt);
-  }
-  #[inline(always)]
-  fn ping(&self) { unsafe {
-    let fake = 0u64;
-    loop {
-      let ret_code = libc::write(self.ping_fd, addr_of!(fake).cast(), 8);
-      if ret_code == -1 {
-        let err_code = *libc::__errno_location();
-        match err_code {
-          libc::EINTR => {
-            continue;
-          },
-          libc::ENOSPC => {
-            continue;
-          }
-          libc::EPIPE |
-          libc::EPERM |
-          libc::EIO |
-          libc::EINVAL |
-          libc::EDQUOT |
-          libc::EFBIG |
-          libc::EFAULT |
-          libc::EBADF |
-          libc::EAGAIN | _ => unreachable!()
-        }
-      }
-      break;
-    }
-    self.wakeup();
-  } }
-}
-
-fn io_polling_routine(worker: &mut FDWorker) { unsafe {
-
-  let parent = &(*worker.parent);
-
-  let poller = loop {
-    let poller = libc::epoll_create(1);
-    if poller == -1 {
-      match poller {
-        libc::ENOMEM => {
-          thread::yield_now(); continue;
-        }
-        libc::EMFILE => {
-          worker.init_code.store(libc::EMFILE, Ordering::Relaxed);
-          return;
-        },
-        libc::EINVAL | _ => unreachable!()
-      }
-    }
-    break poller;
-  };
-  // ping fd
-  let mut ping_event = libc::epoll_event { events: libc::EPOLLIN as u32, u64: 0, };
-  loop {
-    let ret_code = libc::epoll_ctl(poller, libc::EPOLL_CTL_ADD, worker.ping_fd, &mut ping_event);
-    if ret_code == -1 {
-      match *libc::__errno_location() {
-        libc::ENOMEM => {
-          thread::yield_now();
-          continue;
-        },
-        libc::ENOSPC => {
-          worker.init_code.store(libc::ENOSPC, Ordering::Relaxed);
-          return;
-        },
-        libc::ENOENT |
-        libc::ELOOP |
-        libc::EINVAL |
-        libc::EBADF |
-        libc::EFAULT | _ => unreachable!()
-      }
-    }
-    break;
-  }
-  worker.init_code.store(0, Ordering::Release);
-
-  let mut salt = 0;
-  let mut pending_ops = 0usize;
-  const MAX_EVENTS: i32 = 256;
-  let mut inline_poll_data: MaybeUninit<[libc::epoll_event;MAX_EVENTS as usize]> = MaybeUninit::uninit();
-  'main:loop {
-    match worker.parent_asked_to_stop.compare_exchange(
-      true, true, Ordering::AcqRel, Ordering::Relaxed
-    ) {
-      Ok(_) => return,
-      Err(_) => (),
-    }
-    match worker.fd_in.try_recv() {
-      Ok(task) => {
-        let mtd = &mut *task.get_mtd_ptr::<TaskHeader_AnyHeader>();
-        let interest = mtd.ext.epoll_interest;
-        let mut ep_event = libc::epoll_event {
-          events: (
-            interest | libc::EPOLLONESHOT // | libc::EPOLLET// | libc::EPOLLWAKEUP
-          ) as u32,
-          u64: transmute(task),
-        };
-        let fd = mtd.ext2.fd;
-        let outcome = libc::epoll_ctl(poller, libc::EPOLL_CTL_ADD, fd, &mut ep_event);
-        mtd.ext.epoll_ret_code = outcome;
-        task.publish_header_updates();
-        if outcome != 0 {
-          while worker.fd_out.send(task).is_err() {}
-          continue 'main;
-        }
-        pending_ops += 1;
-        continue;
-      },
-      Err(_) => {
-        if pending_ops == 0 {
-          // deep sleep
-          if let Some(real) = futex::futex_wait(&worker.salt, salt, MAX_WAIT_TIME) {
-            salt = real;
-          }
-          continue 'main;
-        }
-      },
-    }
-    // wait for some things here
-    let len = loop {
-      let ret_code = libc::epoll_wait(
-        poller,
-        inline_poll_data.as_mut_ptr().cast(),
-        MAX_EVENTS,
-        -1
-      );
-      if ret_code == -1 {
-        match *libc::__errno_location() {
-          libc::EINTR => {
-            continue;
-          }
-          libc::EINVAL |
-          libc::EBADFD |
-          libc::EFAULT | _ => unreachable!()
-        }
-      }
-      break ret_code as usize;
-    };
-    debug_assert!(len != 0);
-    pending_ops = pending_ops.saturating_sub(len);
-    let ready_items = &inline_poll_data.assume_init_ref()[..len];
-    for item in ready_items {
-      let item: u64 = item.u64;
-      let task: TaskRef = transmute(item);
-      while worker.fd_out.send(task).is_err() {}
-    }
-    parent.wakeup();
-  }
-} }
-
 fn blocking_runner_routine(
   runner: &mut BlockingRunner
 ) { unsafe {
@@ -396,7 +213,7 @@ fn blocking_runner_routine(
       Poll::Pending => 'send:loop {
         match runner.tx_port.send(task) {
           Ok(_) => {
-            (*runner.parent).wakeup();
+            (*runner.parent).ping();
             break 'send
           },
           Err(_) => continue 'send,
@@ -939,7 +756,7 @@ impl Worker {
     unsafe{&(*self.work_group).ralloc}
   }
   #[inline(always)]
-  fn wakeup(&self) {
+  fn ping(&self) {
     debug_assert!(self.was_started(), "Cant wake up uinited worker");
 
     futex::futex_wake(&self.atomics.futex_token);
@@ -971,7 +788,7 @@ impl Worker {
       .stack_size(16*(1024*1024))
       .spawn_unchecked(move || {
         let ptr = copy as *mut Worker;
-        task_processing_routine(ptr)
+        task_processing_loop(ptr)
       }).unwrap()
     };
     loop {
@@ -1151,11 +968,111 @@ impl PageSink for PageStorage {
       self.store_page(page)
     }
 }
+#[derive(Debug, Clone, Copy)]
+pub enum FDError {
+  ResourcesExhausted, InvalidDescriptor
+}
+pub struct FDPoller {
+  pollfd: i32,
+  pending_count: *mut usize,
+}
+impl FDPoller {
+  fn new(
+    pending_count: &mut usize
+  ) -> Result<Self, i32> { unsafe {
+    let poller = libc::epoll_create(1);
+    if poller == -1 {
+      match poller {
+        libc::ENOMEM => {
+          return Err(libc::ENOMEM);
+        }
+        libc::EMFILE => {
+          return Err(libc::EMFILE);
+        },
+        libc::EINVAL | _ => unreachable!()
+      }
+    }
+    return Ok(Self {
+        pollfd: poller,
+        pending_count
+    });
+  } }
+  pub fn put(&self, fd: i32,  interest: FdInterest, task: TaskRef) -> Result<(), FDError> {
+    let interest = match interest {
+      FdInterest::Read => libc::POLLIN,
+      FdInterest::Write => libc::POLLOUT,
+      FdInterest::ReadWrite => libc::POLLIN | libc::POLLOUT,
+    };
+    let mut ep_event = libc::epoll_event {
+      events: (
+        interest as i32 | libc::EPOLLONESHOT //| libc::EPOLLET // | libc::EPOLLWAKEUP
+      ) as u32,
+      u64: unsafe {transmute(task)},
+    };
+    let outcome = unsafe {
+      libc::epoll_ctl(self.pollfd, libc::EPOLL_CTL_ADD, fd, &mut ep_event)
+    };
+    if outcome != 0 {
+      let err_code = unsafe{*libc::__errno_location()};
+      match err_code {
+        libc::EINVAL |
+        libc::EPERM |
+        libc::EBADF => return Err(FDError::InvalidDescriptor),
+        libc::ENOSPC |
+        libc::ENOMEM => return Err(FDError::ResourcesExhausted),
+        libc::EEXIST => {
+          let ret_code = unsafe { libc::epoll_ctl(self.pollfd, libc::EPOLL_CTL_MOD, fd, &mut ep_event) };
+          assert!(ret_code == 0);
+        }
+        libc::ENOENT |
+        libc::ELOOP |
+        _ => unreachable!("epoll_ctl unexpectedly failed with error {}", err_code)
+      }
+    }
+    unsafe {(*self.pending_count) += 1};
+    return Ok(());
+  }
+  fn ckeck_ready(&self) -> Option<(TaskPack, usize)> { unsafe {
+    const MAX_EVENTS: usize = 16;
+    let mut inline_poll_data: MaybeUninit<[libc::epoll_event;MAX_EVENTS]> = MaybeUninit::uninit();
+    let num_events = loop {
+      let ret_val = libc::epoll_wait(
+        self.pollfd,
+        inline_poll_data.as_mut_ptr().cast(),
+        MAX_EVENTS as i32,
+        0
+      );
+      if ret_val == -1 {
+        match *libc::__errno_location() {
+          libc::EINTR => {
+            continue;
+          }
+          libc::EINVAL |
+          libc::EBADFD |
+          libc::EFAULT | _ => unreachable!()
+        }
+      }
+      break ret_val as usize;
+    };
+    if num_events == 0 {
+      return None;
+    }
+    (*self.pending_count) -= num_events;
+    let mut result = TaskPack { uninit: () };
+    for i in 0 .. num_events {
+      let ipd = inline_poll_data.assume_init_ref()[i];
+      let ret_v = ipd.u64;
+      let resume_task: TaskRef = transmute(ret_v);
+      result.tasks[i] = resume_task;
+    }
+    return Some((result, num_events));
+  } }
+}
 
 enum ExecState {
   Fetch, Sleep, Execute, Shutdown
 }
-fn task_processing_routine(worker_: *mut Worker) { unsafe {
+fn task_processing_loop(worker_: *mut Worker) { unsafe {
 
   let this_worker = &mut*worker_;
 
@@ -1175,6 +1092,14 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
   let virt_mem = VirtMem::new();
   let mut task_set = TaskSet::new();
   let mut current_task : TaskRef = TaskRef::new_null();
+  let mut pending_ops_count = 0;
+  let fd_poller = match FDPoller::new(&mut pending_ops_count) {
+    Ok(poller) => poller,
+    Err(ret_code) => {
+      this_worker.atomics.init_code.store(ret_code, Ordering::Relaxed);
+      return;
+    },
+  };
 
   let (br_tx_in, br_tx_out) = std::sync::mpsc::channel();
   let (br_rx_in, br_rx_out) = std::sync::mpsc::channel();
@@ -1186,57 +1111,13 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
     token: futex::Token::new(),
     should_stop: AtomicBool::new(false),
   };
-  let (tx_fd_in, rx_fd_in) = std::sync::mpsc::channel();
-  let (rx_fd_out, tx_fd_out) = std::sync::mpsc::channel();
-  let mut fd_thread = FDWorker {
-    parent: worker_,
-    handle: None,
-    parent_asked_to_stop: AtomicBool::new(false),
-    ping_fd: loop {
-      let fd = libc::eventfd(0, libc::EFD_NONBLOCK);
-      if fd == -1 {
-        match *libc::__errno_location() {
-          libc::ENOMEM => {
-            thread::yield_now();
-            continue;
-          },
-          libc::ENODEV => {
-            this_worker.atomics.init_code.store(libc::ENODEV, Ordering::Relaxed);
-            return;
-          },
-          libc::ENFILE => {
-            this_worker.atomics.init_code.store(libc::ENFILE, Ordering::Relaxed);
-            return;
-          },
-          libc::EMFILE => {
-            this_worker.atomics.init_code.store(libc::EMFILE, Ordering::Relaxed);
-            return;
-          },
-          libc::EINVAL | _ => unreachable!()
-        }
-      }
-      break fd
-    },
-    init_code: AtomicI32::new(-1),
-    salt: futex::Token::new(),
-    fd_in: rx_fd_in,
-    fd_out: rx_fd_out,
-  };
-
-  match fd_thread.try_start() {
-    Ok(_) => (),
-    Err(err) => {
-      this_worker.atomics.init_code.store(err, Ordering::Relaxed);
-      return;
-    },
-  }
 
   let mut task_context = TaskCtx(UnsafeCell::new(TaskContextInternals {
     allocator: addr_of!(allocator),
     task_set: addr_of_mut!(task_set),
-    task_dependency_info: TaskDependency::Unreachable,
+    task_dependency_info: TaskResolution::UNREACHABLE,
     current_task: addr_of!(current_task),
-    fd_sink: addr_of!(tx_fd_in),
+    poller: addr_of!(fd_poller),
     mem_router: addr_of!(mem_controller),
     mballoc: addr_of!(mballoc),
     virt_mem: addr_of!(virt_mem)
@@ -1246,7 +1127,7 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
   this_worker.wait_first_init_release();
   fence(Ordering::AcqRel);
 
-  let mut pending_ops_count = 0;
+
   let mut salt = 0;
   let mut exec_state = ExecState::Fetch;
 
@@ -1255,12 +1136,19 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
       ExecState::Fetch => {
         try_transfer_excess(this_worker, &mut task_set, &mem_controller);
         if let Some((new_task, free_mem)) = (task_set).deque_one() {
-          current_task = new_task;
           if let Some(free_mem) = free_mem {
             mem_controller.recycle_page(free_mem);
           }
-          exec_state = ExecState::Execute;
-          continue 'dispatch;
+          let ok = new_task.try_aquire_ownership();
+          if ok {
+            current_task = new_task;
+            exec_state = ExecState::Execute;
+            continue 'dispatch;
+          } else {
+            let ok = task_set.enque(new_task, &mem_controller);
+            assert!(ok);
+            continue 'dispatch;
+          }
         }
         loop {
           match this_worker.rx_port.try_recv() {
@@ -1299,17 +1187,8 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
           Err(_) => (),
         }
         // check if some fds are ready
-        if let Ok(task) = tx_fd_out.try_recv() {
-          let ok = task_set.enque(task, &mem_controller);
-          debug_assert!(ok);
-          pending_ops_count -= 1;
-          let mut capacity = task_set.remaining_capacity();
-          while capacity != 0 && let Ok(task) = tx_fd_out.try_recv() {
-            let ok = task_set.enque(task, &mem_controller);
-            debug_assert!(ok);
-            pending_ops_count -= 1;
-            capacity -= 1;
-          }
+        if let Some((pack, len)) = fd_poller.ckeck_ready() {
+          task_set.insert_pack(pack, len);
           continue 'dispatch;
         }
         this_worker.advertise_as_available();
@@ -1342,7 +1221,6 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
         };
         page_store.dispose_mem();
         blocking_runner.stop();
-        fd_thread.stop();
         return;
       }
       ExecState::Execute => {
@@ -1374,18 +1252,7 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
           },
           core::task::Poll::Pending => {
             match task_context.read_task_dependency() {
-              TaskDependency::FDWait { need_requeue: want_requeue } => {
-                if want_requeue {
-                  let ok = task_set.enque(current_task, &mem_controller);
-                  debug_assert!(ok);
-                } else {
-                  pending_ops_count += 1;
-                  fd_thread.ping();
-                }
-                exec_state = ExecState::Fetch;
-                continue 'dispatch;
-              },
-              TaskDependency::RunBlocking => {
+              TaskResolution::RunBlocking => {
                 current_task.publish_backing_memory_changes();
                 while br_tx_in.send(current_task).is_err() {}
                 blocking_runner.ping();
@@ -1393,19 +1260,18 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
                 exec_state = ExecState::Fetch;
                 continue 'dispatch;
               },
-              TaskDependency::Reschedule => {
+              TaskResolution::Reschedule => {
                 let ok = task_set.enque(current_task, &mem_controller);
                 assert!(ok);
                 exec_state = ExecState::Fetch;
                 continue 'dispatch;
               },
-              TaskDependency::Release => {
-                fence(Ordering::SeqCst);
+              TaskResolution::Release => {
                 current_task.release_ownership();
                 exec_state = ExecState::Fetch;
                 continue 'dispatch;
               },
-              TaskDependency::Unreachable => unreachable!(),
+              TaskResolution::UNREACHABLE => unreachable!(),
             }
           },
         }
@@ -1414,6 +1280,7 @@ fn task_processing_routine(worker_: *mut Worker) { unsafe {
   }
 } }
 
+// todo: rework this to something better...
 fn try_transfer_excess(
   src_worker: &mut Worker,
   workset: &mut TaskSet,
@@ -1449,7 +1316,7 @@ fn try_transfer_excess(
     while free_worker.tx_port.send(InterworkerMessage::Pack(pack.tasks, len)).is_err() {}
     token.signal_init_release();
     fence(Ordering::AcqRel);
-    free_worker.wakeup();
+    free_worker.ping();
   }
 } }
 
@@ -1473,7 +1340,7 @@ fn give_away_mem(
     let res = worker.tx_port.send(InterworkerMessage::Memory(page));
     assert!(res.is_ok());
     fence(Ordering::AcqRel);
-    worker.wakeup();
+    worker.ping();
   }
 }
 
@@ -1488,8 +1355,8 @@ pub struct TaskContextInternals {
   pub mem_router: *const MemRouter,
   pub allocator: *const TaskAllocator,
   pub task_set: *mut TaskSet,
-  pub task_dependency_info: TaskDependency,
-  pub fd_sink: *const std::sync::mpsc::Sender<TaskRef>,
+  pub task_dependency_info: TaskResolution,
+  pub poller: *const FDPoller,
   pub mballoc: *const MBAlloc,
   pub virt_mem: *const VirtMem
 }
@@ -1497,10 +1364,10 @@ impl TaskCtx {
   pub fn inner(&self) -> &mut TaskContextInternals {
     unsafe { &mut*self.0.get() }
   }
-  pub fn read_task_dependency(&self) -> TaskDependency {
+  pub fn read_task_dependency(&self) -> TaskResolution {
     self.inner().task_dependency_info
   }
-  pub fn write_task_dependency(&self, dep_info: TaskDependency) {
+  pub fn write_task_resolution(&self, dep_info: TaskResolution) {
     self.inner().task_dependency_info = dep_info;
   }
   pub fn current_task(&self) -> TaskRef {
@@ -1601,7 +1468,8 @@ impl TaskRef {
   }
   #[inline(always)]
   pub fn release_ownership(&self) {
-    let ok = self.get_mtd_ref::<TaskHeader_AnyHeader>().is_owned.compare_exchange(
+    let is_owned = &self.get_mtd_ref::<TaskHeader_AnyHeader>().is_owned;
+    let ok = is_owned.compare_exchange(
       true, false, Ordering::Release, Ordering::Relaxed
     ).is_ok();
     assert!(ok, "For some reason cant release an owned task");
@@ -1750,7 +1618,7 @@ impl FaRT {
     for ix in 0 .. total_worker_count {
       let wref = (*this).worker_set.get_worker_at_index(ix as _);
       if wref.was_started() {
-        wref.wakeup();
+        wref.ping();
         wref.runner_handle.take().unwrap().join().unwrap();
       }
     }
@@ -1807,7 +1675,7 @@ impl RtRef {
         poll_fun: poll_fun,
         ext: Ext { uninit: () },
         ext2: Ext2 { uninit: () },
-        is_owned: AtomicBool::new(true)
+        is_owned: AtomicBool::new(false)
       },
       operation
     );
@@ -1818,10 +1686,11 @@ impl RtRef {
       simd: Simd::splat(0)
     };
     item.tasks[0] = task_ref;
-    while worker.tx_port.send(InterworkerMessage::Pack(item.tasks, 1)).is_err() {};
+    let ok = worker.tx_port.send(InterworkerMessage::Pack(item.tasks, 1)).is_ok();
+    assert!(ok, "run_to_completion failed to send a task");
     fence(Ordering::AcqRel);
     token.signal_init_release();
-    worker.wakeup();
+    worker.ping();
     loop {
       if resume_mtd.flag.load_value() != 0 { break }
       let _ = futex::futex_wait(&resume_mtd.flag, 0, MAX_WAIT_TIME);
@@ -1903,6 +1772,7 @@ check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, poll_fun);
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, frame_size_data);
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, ext);
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, ext2);
+check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_ThreadResumer, is_owned);
 
 #[repr(C)] #[allow(non_camel_case_types)]
 struct TaskHeader_Independent {
@@ -1916,20 +1786,18 @@ check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_Independent, poll_fun);
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_Independent, frame_size_data);
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_Independent, ext);
 check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_Independent, ext2);
+check_reverse_offset!(TaskHeader_AnyHeader, TaskHeader_Independent, is_owned);
 
 impl ValidTaskHeaderMarker for TaskHeader_ThreadResumer {}
 impl ValidTaskHeaderMarker for TaskHeader_Independent {}
 impl ValidTaskHeaderMarker for TaskHeader_AnyHeader {}
 
 #[derive(Clone, Copy)]
-pub enum TaskDependency {
-  FDWait {
-    need_requeue: bool
-  },
+pub enum TaskResolution {
   RunBlocking,
   Reschedule,
   Release,
-  Unreachable
+  UNREACHABLE
 }
 
 type SomePollFun = fn (*mut (), *mut ()) -> Poll<()>;
@@ -1958,7 +1826,7 @@ pub fn launch_detached<F>(operation: F) -> impl Future<Output = ()> where F:Futu
           );
           let frame_ref = if let Some(frame) = outcome { frame } else {
             // aint got mem (in the system)
-            ctx.write_task_dependency(TaskDependency::Reschedule);
+            ctx.write_task_resolution(TaskResolution::Reschedule);
             return Poll::Pending;
           };
           TaskRef::new(frame_ref, TaskFrameType::IndependentTA)
@@ -1970,14 +1838,14 @@ pub fn launch_detached<F>(operation: F) -> impl Future<Output = ()> where F:Futu
             // no mem
             // todo: park tasks that need memory instead of
             // rescheduling them
-            ctx.write_task_dependency(TaskDependency::Reschedule);
+            ctx.write_task_resolution(TaskResolution::Reschedule);
             return Poll::Pending;
           }
           let vm_range = (*inner.virt_mem).alloc_page_space(required_page_count).unwrap();
           let ptr = vm_range.fill(&*inner.mem_router);
           TaskRef::new(ptr, TaskFrameType::IndependentVM)
         },
-        _ => todo!("frame size can be at most 128MiB, given was {} bytes", size_of::<F>())
+        _ => todo!("frame size can be at most 128MiB, given was {} bytes", size)
       };
       let subtask = allocated_task;
       subtask.get_data_ptr().cast::<F>().write(oper.assume_init_read());
@@ -1991,11 +1859,11 @@ pub fn launch_detached<F>(operation: F) -> impl Future<Output = ()> where F:Futu
         poll_fun: pfn,
         ext: Ext { uninit: () },
         ext2: Ext2 { uninit: () },
-        is_owned: AtomicBool::new(true)
+        is_owned: AtomicBool::new(false)
       });
       task_to_dispatch = Some(subtask);
       if free_slot_count == 1 {
-        ctx.write_task_dependency(TaskDependency::Reschedule);
+        ctx.write_task_resolution(TaskResolution::Reschedule);
         return Poll::Pending;
       }
       let ok = task_set.enque(subtask, pm);
@@ -2003,7 +1871,7 @@ pub fn launch_detached<F>(operation: F) -> impl Future<Output = ()> where F:Futu
       return Poll::Ready(());
     } else {
       if free_slot_count == 1 {
-        ctx.write_task_dependency(TaskDependency::Reschedule);
+        ctx.write_task_resolution(TaskResolution::Reschedule);
         return Poll::Pending;
       }
       let ok = task_set.enque(*task_to_dispatch.as_ref().unwrap(), pm);
@@ -2021,7 +1889,7 @@ pub fn run_isolated<R>(operation: impl (FnOnce() -> R) + Send) -> impl Future<Ou
     match ix {
       0 => {
         let ctx: &mut TaskCtx = transmute(ctx);
-        ctx.write_task_dependency(TaskDependency::RunBlocking);
+        ctx.write_task_resolution(TaskResolution::RunBlocking);
         ix += 1;
         return Poll::Pending;
       },
@@ -2039,55 +1907,58 @@ pub fn run_isolated<R>(operation: impl (FnOnce() -> R) + Send) -> impl Future<Ou
     }
   })
 }
-
+#[derive(Debug, Clone, Copy)]
 pub enum FdInterest {
   Read, Write, ReadWrite
 }
-pub fn wait_on_fd(fd: &dyn AsFd, interest: FdInterest) -> impl Future<Output = ()> {
+#[must_use]
+pub fn wait_on_fd<'a>(fd: &'a dyn AsFd, interest: FdInterest) -> impl Future<Output = Result<(), FDError>> + 'a {
   let rfd = fd.as_fd().as_raw_fd();
   let mut setup_done = false;
   let mut need_retry = false;
   core::future::poll_fn(move |ctx| unsafe {
     let ctx: &mut TaskCtx = transmute(ctx);
     if !setup_done {
-      let interest = match interest {
-        FdInterest::Read => libc::POLLIN,
-        FdInterest::Write => libc::POLLOUT,
-        FdInterest::ReadWrite => libc::POLLIN | libc::POLLOUT,
-      };
       let ct = ctx.current_task();
-      let mtd = &mut*ct.get_mtd_ptr::<TaskHeader_AnyHeader>();
-      mtd.ext2.fd = rfd;
-      mtd.ext.epoll_interest = interest as i32 ;
-      setup_done = true;
-
       let ictx = &*ctx.0.get();
-      let outcome = (*ictx.fd_sink).send(ct);
-      let failed = match outcome {
-        Ok(_) => false,
-        Err(_) => true,
+      let outcome = (*ictx.poller).put(rfd, interest, ct);
+      match outcome {
+        Ok(_) => {
+          setup_done = true;
+          ctx.write_task_resolution(TaskResolution::Release);
+          return Poll::Pending;
+        },
+        Err(FDError::InvalidDescriptor) => {
+          return Poll::Ready(Err(FDError::InvalidDescriptor));
+        },
+        Err(FDError::ResourcesExhausted) => {
+          need_retry = true;
+          ctx.write_task_resolution(TaskResolution::Reschedule);
+          return Poll::Pending;
+        }
       };
-      need_retry = failed;
-      ctx.write_task_dependency(TaskDependency::FDWait {
-        need_requeue: need_retry
-      });
-      return Poll::Pending;
     }
     if need_retry {
       let ct = ctx.current_task();
       let ictx = &*ctx.0.get();
-      let outcome = (*ictx.fd_sink).send(ct);
-      let failed = match outcome {
-        Ok(_) => false,
-        Err(_) => true,
+      let outcome = (*ictx.poller).put(rfd, interest, ct);
+      match outcome {
+        Ok(_) => {
+          setup_done = true;
+          ctx.write_task_resolution(TaskResolution::Release);
+          return Poll::Pending;
+        },
+        Err(FDError::InvalidDescriptor) => {
+          return Poll::Ready(Err(FDError::InvalidDescriptor));
+        },
+        Err(FDError::ResourcesExhausted) => {
+          need_retry = true;
+          ctx.write_task_resolution(TaskResolution::Reschedule);
+          return Poll::Pending;
+        }
       };
-      need_retry = failed;
-      ctx.write_task_dependency(TaskDependency::FDWait {
-        need_requeue: need_retry
-      });
-      return Poll::Pending;
     }
-    return Poll::Ready(());
+    return Poll::Ready(Ok(()));
   })
 }
 
@@ -2097,7 +1968,7 @@ pub fn yield_now() -> impl Future<Output = ()> {
     if first {
       first = false;
       let ctx: &mut TaskCtx = transmute(ctx);
-      ctx.write_task_dependency(TaskDependency::Reschedule);
+      ctx.write_task_resolution(TaskResolution::Reschedule);
       return Poll::Pending;
     } else {
       return Poll::Ready(());
@@ -2105,12 +1976,14 @@ pub fn yield_now() -> impl Future<Output = ()> {
   })
 }
 
+
+
 #[derive(Debug, Clone, Copy)]
-pub enum TimerCreationFailure {
+pub enum AlarmCreationFailure {
   ResourceExhaustion, InvalidPeriodTime
 }
 #[derive(Debug, Clone, Copy)]
-pub enum TimerPeriodResetFailure {
+pub enum AlarmPeriodResetFailure {
   InvalidPeriodTime
 }
 
@@ -2122,7 +1995,7 @@ pub struct PeriodicAlarm {
 impl PeriodicAlarm {
   pub fn new_periodic(
     fire_period: Duration
-  ) -> Result<Self, TimerCreationFailure> { unsafe {
+  ) -> Result<Self, AlarmCreationFailure> { unsafe {
     const LIMIT: u128 = 999_999_999;
     let ns_time = fire_period.as_nanos();
     let s_time_period = ns_time / LIMIT;
@@ -2130,7 +2003,7 @@ impl PeriodicAlarm {
       if s_time_period == 0 { ns_time }
       else { ns_time - (LIMIT * s_time_period)  };
     if ns_time_period > LIMIT || ns_time_period == 0 {
-      return Err(TimerCreationFailure::InvalidPeriodTime);
+      return Err(AlarmCreationFailure::InvalidPeriodTime);
     }
     let errno_loc = libc::__errno_location();
     let timer_fd = libc::timerfd_create(libc::CLOCK_REALTIME, libc::TFD_NONBLOCK);
@@ -2139,7 +2012,7 @@ impl PeriodicAlarm {
       match err_code {
         libc::ENOMEM |
         libc::ENFILE |
-        libc::EMFILE => return Err(TimerCreationFailure::ResourceExhaustion),
+        libc::EMFILE => return Err(AlarmCreationFailure::ResourceExhaustion),
         libc::ENODEV |
         libc::EPERM |
         libc::EINVAL | _ => unreachable!("createfd_timer unexpectedly failed with errcode {}", err_code)
@@ -2166,7 +2039,7 @@ impl PeriodicAlarm {
     };
     return Ok(timer);
   } }
-  pub fn set_new_period(&mut self, new_period: Duration) -> Result<(), TimerPeriodResetFailure>{ unsafe {
+  pub fn set_new_period(&mut self, new_period: Duration) -> Result<(), AlarmPeriodResetFailure>{ unsafe {
     const LIMIT: u128 = 999_999_999;
     let ns_time = new_period.as_nanos();
     let s_time_period = ns_time / LIMIT;
@@ -2174,7 +2047,7 @@ impl PeriodicAlarm {
       if s_time_period == 0 { ns_time }
       else { ns_time - (LIMIT * s_time_period)  };
     if ns_time_period > LIMIT || ns_time_period == 0 {
-      return Err(TimerPeriodResetFailure::InvalidPeriodTime);
+      return Err(AlarmPeriodResetFailure::InvalidPeriodTime);
     }
     let ns_time_period = ns_time_period as i64;
     let s_time_period = s_time_period as i64;
@@ -2216,9 +2089,9 @@ impl PeriodicAlarm {
     assert!(ret_val == 0);
   } }
   pub fn resume(&self) {
-    let mut crap = MaybeUninit::<libc::itimerspec>::uninit();
+    let mut old = self.timer_spec;
     let ret_val = unsafe {
-      libc::timerfd_settime(self.fd, 0, &self.timer_spec, crap.as_mut_ptr())
+      libc::timerfd_settime(self.fd, 0, &self.timer_spec, &mut old)
     };
     assert!(ret_val == 0);
   }
@@ -2256,7 +2129,6 @@ impl AsFd for PeriodicAlarm {
     unsafe { std::os::unix::prelude::BorrowedFd::borrow_raw(self.fd) }
   }
 }
-
 
 #[test]
 fn t() {
@@ -2342,7 +2214,7 @@ fn sock() {
     socket.set_nonblocking(true).unwrap();
 
     loop {
-      wait_on_fd(&socket, FdInterest::Read).await;
+      wait_on_fd(&socket, FdInterest::Read).await.unwrap();
       match socket.accept() {
         Ok((stream, _)) => {
           launch_detached(process_incoming(stream)).await;
@@ -2359,7 +2231,7 @@ fn sock() {
     let stream = stream;
     stream.set_nonblocking(true).unwrap();
 
-    wait_on_fd(&stream, FdInterest::Read).await;
+    wait_on_fd(&stream, FdInterest::Read).await.unwrap();
 
 
     println!("Pise4ka!")
@@ -2377,10 +2249,10 @@ fn timer_test() {
     alarm.resume();
     let start = std::time::Instant::now();
     println!("began waiting on the thing");
-    wait_on_fd(&alarm, FdInterest::Read).await;
+    wait_on_fd(&alarm, FdInterest::Read).await.unwrap();
     println!("waiting finished. Spent {:?}", start.elapsed());
     alarm.set_new_period(Duration::from_secs(5)).unwrap();
-    wait_on_fd(&alarm, FdInterest::Read).await;
+    wait_on_fd(&alarm, FdInterest::Read).await.unwrap();
     println!("waiting finished. Spent {:?}", start.elapsed());
   }).unwrap();
 }

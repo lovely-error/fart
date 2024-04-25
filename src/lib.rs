@@ -48,14 +48,17 @@ pub use driver_async::{
   yield_now,
   FaRT,
   RtRef,
+  PeriodicAlarm,
+  FdInterest
 };
 
 // mod pipe;
 #[allow(dead_code)]
 mod block_allocator;
 
-// #[allow(unused_imports)]
-// mod fd_table;
+#[allow(unused_imports)]
+#[allow(dead_code)]
+mod fd_table;
 
 #[allow(dead_code)]
 mod cl_lock;

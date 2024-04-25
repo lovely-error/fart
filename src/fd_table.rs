@@ -1,6 +1,6 @@
 use core::{cell::UnsafeCell, mem::{size_of, transmute, MaybeUninit}, ptr::{addr_of, addr_of_mut, null_mut}, sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}, time::Duration};
 
-use crate::{driver_async::TaskRef, futex, root_alloc::{Block4KPtr, RootAllocator}, utils::{publish_changes_on_memory, FailablePageSource}};
+use crate::{driver_async::TaskRef, futex, root_alloc::{Block4KPtr, RootAllocator}, utils::{publish_changes_on_memory, PageSource}};
 
 macro_rules! static_assert {
     ($cond:expr) => {
@@ -25,7 +25,7 @@ struct FDPage {
   submit_map: MaybeUninit<[AtomicU64;MAP_LEN]>,
   submit_fds: [TaskRef;FDS_MAX],
   ready_map: MaybeUninit<[AtomicU64;MAP_LEN]>,
-  ready_fds: [TaskRef;FDS_MAX],
+  ready_fds: MaybeUninit<[TaskRef;FDS_MAX]>,
   next_page: AtomicUsize,
 }
 static_assert!(size_of::<FDPage>() == 4096);
@@ -69,7 +69,7 @@ impl FDTable {
     self.inner().first_page.load(Ordering::Acquire) as _
   }
   #[must_use]
-  pub(crate) fn tx_try_put(&self, task: TaskRef, page_source: &dyn FailablePageSource) -> bool {
+  pub(crate) fn tx_try_put(&self, task: TaskRef, page_source: &dyn PageSource) -> bool {
     self.tx_try_put_impl(task, page_source, false)
   }
   pub(crate) fn tx_try_get(&self) -> Option<TaskRef> {
@@ -99,7 +99,7 @@ impl FDTable {
       continue 'free_slot_search;
     };
     unsafe {
-      let addr = addr_of_mut!((*ptr).ready_fds[(six * 64) + ix]);
+      let addr = addr_of_mut!((*ptr).ready_fds.assume_init_mut()[(six * 64) + ix]);
       let val = addr.read();
       let mask = 1 << ix;
       let prior = segment_map_ref[six].fetch_and(!mask, Ordering::Release);
@@ -176,7 +176,7 @@ impl FDTable {
     };
     unsafe {
       let index = (six * 64) + ix;
-      let addr = addr_of_mut!((*ptr).ready_fds[index]);
+      let addr = addr_of_mut!((*ptr).ready_fds.assume_init_mut()[index]);
       addr.write(task);
       let mask = 1 << ix;
       let prior = segment_map_ref[six].fetch_or(mask, Ordering::Release);
@@ -190,11 +190,11 @@ impl FDTable {
   pub(crate) fn tx_try_put_impl(
     &self,
     task: TaskRef,
-    page_source: &dyn FailablePageSource,
+    page_source: &dyn PageSource,
     in_test_mode:bool
   ) -> bool {
     if self.is_uninit() {
-      let page = match page_source.try_drain_page() {
+      let page = match page_source.try_get_page() {
         Some(page) => page,
         None => return false,
       };
@@ -219,7 +219,7 @@ impl FDTable {
       }
       let next = unsafe { (*ptr).next_page.load(Ordering::Acquire) };
       let next = if next == 0 {
-        let page = match page_source.try_drain_page() {
+        let page = match page_source.try_get_page() {
           Some(page) => page,
           None => return false,
         };
@@ -349,7 +349,7 @@ fn threaded_prod_cons_check_few_times_more() {
   for _ in 0 .. total_count {
     std::panic::set_hook(Box::new(|_|{}));
     let result = std::panic::catch_unwind(|| {
-      threaded_prod_cons_check()
+      threaded_prod_cons_check_()
     });
     match result {
       Ok(_) => (),
@@ -368,8 +368,9 @@ fn threaded_prod_cons_check_few_times_more() {
   );
 }
 
+
 #[test] #[ignore]
-fn threaded_prod_cons_check() {
+fn threaded_prod_cons_check_() {
 
   struct Env {
     tx_salt: futex::Token,
