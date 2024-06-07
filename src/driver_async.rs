@@ -1005,7 +1005,8 @@ impl FDPoller {
     };
     let mut ep_event = libc::epoll_event {
       events: (
-        interest as i32 | libc::EPOLLONESHOT //| libc::EPOLLET // | libc::EPOLLWAKEUP
+        interest as i32 | libc::EPOLLONESHOT | libc::EPOLLET |
+        libc::EPOLLRDHUP | libc::EPOLLPRI | libc::EPOLLERR | libc::EPOLLHUP
       ) as u32,
       u64: unsafe {transmute(task)},
     };
@@ -1643,7 +1644,7 @@ impl RtRef {
     return Some(wref);
   }
   #[must_use]
-  pub fn run_to_completion<F: Future<Output = ()> + Send>(&self, operation: F) -> Result<(), RunFailure> { unsafe {
+  pub fn run_to_completion<F: Future<Output = ()>>(&self, operation: F) -> Result<(), RunFailure> { unsafe {
     let (worker, token) = loop {
       if let Some(w) = self.try_find_free_worker() {
         match w.try_start_() {
@@ -1803,7 +1804,7 @@ pub enum TaskResolution {
 type SomePollFun = fn (*mut (), *mut ()) -> Poll<()>;
 
 
-pub fn launch_detached<F>(operation: F) -> impl Future<Output = ()> where F:Future<Output=()> + Send + 'static {
+pub fn launch_detached<F>(operation: F) -> impl Future<Output = ()> where F:Future<Output=()> + 'static {
   let mut oper = MaybeUninit::uninit();
   oper.write(operation);
   let mut task_to_dispatch = None;

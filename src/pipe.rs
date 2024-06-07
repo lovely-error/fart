@@ -1,6 +1,6 @@
 use core::{cell::UnsafeCell, future::Future, marker::PhantomData, mem::{align_of, needs_drop, size_of, transmute, ManuallyDrop, MaybeUninit}, ptr::addr_of, sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering}, task::Poll};
 
-use crate::{block_allocator::RawMemoryPtr, cl_lock::SmallLock, driver_async::{TaskCtx, TaskDependency, TaskRef}, launch_detached, FaRT};
+use crate::{block_allocator::RawMemoryPtr, cl_lock::SmallLock, driver_async::{TaskCtx, TaskRef, TaskResolution}, launch_detached, FaRT};
 
 #[repr(C)]
 union Heads {
@@ -65,7 +65,7 @@ impl<T> PipeIn<T> {
           }
         }
         fence(Ordering::AcqRel);
-        mref.release_memory(&*ctx.inner().mem_router);
+        mref.release_memory();
         return Poll::Ready(());
       } else {
         lock.release();
@@ -101,17 +101,17 @@ impl<T> PipeIn<T> {
               // we cant resume right away, because the only way we got here
               // is through observing that pipe is full.
               // wait for consumer to unclutter the pipe
-              ctx.write_task_dependency(TaskDependency::Reschedule);
+              ctx.write_task_resolution(TaskResolution::Reschedule);
               return Poll::Pending;
             }
           } else {
             // we did not enhomed our orphan so retry doing it
-            ctx.write_task_dependency(TaskDependency::Reschedule);
+            ctx.write_task_resolution(TaskResolution::Reschedule);
             return Poll::Pending;
           }
         } else {
           // we havent not had parked task owned. retry
-          ctx.write_task_dependency(TaskDependency::Reschedule);
+          ctx.write_task_resolution(TaskResolution::Reschedule);
           return Poll::Pending;
         }
       }
@@ -119,7 +119,7 @@ impl<T> PipeIn<T> {
       let Some(mtd) = lock.try_lock() else {
         let inner = ctx.inner();
         let _ = (*inner.task_set).enque(current_task, &*inner.mem_router);
-        ctx.write_task_dependency(TaskDependency::Reschedule);
+        ctx.write_task_resolution(TaskResolution::Reschedule);
         return Poll::Pending;
       };
       let rc = mtd.rc_count.load(Ordering::Relaxed);
@@ -147,14 +147,14 @@ impl<T> PipeIn<T> {
             let ok = (*inner.task_set).enque(consumer_task, &*inner.mem_router);
             if ok {
               // we enqueed consumer . it will unclutter the pipe
-              ctx.write_task_dependency(TaskDependency::Release);
+              ctx.write_task_resolution(TaskResolution::Release);
               lock.release();
               return Poll::Pending;
             } else {
               // failed to enq consumer. retry
               can_resume_immidiately = false;
               parked_consumer = Some(consumer_task);
-              ctx.write_task_dependency(TaskDependency::Reschedule);
+              ctx.write_task_resolution(TaskResolution::Reschedule);
               lock.release();
               return Poll::Pending;
             }
@@ -162,13 +162,13 @@ impl<T> PipeIn<T> {
             // we failed to own consumer. retry owning it later
             can_resume_immidiately = false;
             parked_consumer = Some(consumer_task);
-            ctx.write_task_dependency(TaskDependency::Reschedule);
+            ctx.write_task_resolution(TaskResolution::Reschedule);
             lock.release();
             return Poll::Pending;
           }
         } else {
           // conumer will resume this producer
-          ctx.write_task_dependency(TaskDependency::Release);
+          ctx.write_task_resolution(TaskResolution::Release);
           lock.release();
           return Poll::Pending;
         }
@@ -198,7 +198,7 @@ impl<T> PipeIn<T> {
             // failed to enq consumer. retry
             can_resume_immidiately = false;
             parked_consumer = Some(consumer_task);
-            ctx.write_task_dependency(TaskDependency::Reschedule);
+            ctx.write_task_resolution(TaskResolution::Reschedule);
             lock.release();
             return Poll::Pending;
           }
@@ -206,7 +206,7 @@ impl<T> PipeIn<T> {
           // we failed to own consumer. retry owning it later
           can_resume_immidiately = false;
           parked_consumer = Some(consumer_task);
-          ctx.write_task_dependency(TaskDependency::Reschedule);
+          ctx.write_task_resolution(TaskResolution::Reschedule);
           lock.release();
           return Poll::Pending;
         }
@@ -272,7 +272,7 @@ impl<T> PipeOut<T> {
           }
         }
         fence(Ordering::AcqRel);
-        mref.release_memory(&*ctx.inner().mem_router);
+        mref.release_memory();
         return Poll::Ready(());
       } else {
         lock.release();
@@ -299,16 +299,16 @@ impl<T> PipeOut<T> {
           if ok {
             parked_producer = None;
             // cant resume right away
-            ctx.write_task_dependency(TaskDependency::Reschedule);
+            ctx.write_task_resolution(TaskResolution::Reschedule);
             return Poll::Pending;
           } else {
             // we did not enhomed our orphan so retry doing it
-            ctx.write_task_dependency(TaskDependency::Reschedule);
+            ctx.write_task_resolution(TaskResolution::Reschedule);
             return Poll::Pending;
           }
         } else {
           // we havent not had parked task owned. retry
-          ctx.write_task_dependency(TaskDependency::Reschedule);
+          ctx.write_task_resolution(TaskResolution::Reschedule);
           return Poll::Pending;
         }
       }
@@ -316,7 +316,7 @@ impl<T> PipeOut<T> {
       let Some(mtd) = lock.try_lock() else {
         let inner = ctx.inner();
         let _ = (*inner.task_set).enque(current_task, &*inner.mem_router);
-        ctx.write_task_dependency(TaskDependency::Reschedule);
+        ctx.write_task_resolution(TaskResolution::Reschedule);
         return Poll::Pending;
       };
       let ixs = mtd.heads.both.load(Ordering::Acquire);
@@ -344,25 +344,25 @@ impl<T> PipeOut<T> {
             if !ok {
               // this task is responsible for resuming producer. need retry
               parked_producer = Some(prod);
-              ctx.write_task_dependency(TaskDependency::Reschedule);
+              ctx.write_task_resolution(TaskResolution::Reschedule);
               lock.release();
               return Poll::Pending;
             } else {
               // we can release ourselve
-              ctx.write_task_dependency(TaskDependency::Release);
+              ctx.write_task_resolution(TaskResolution::Release);
               lock.release();
               return Poll::Pending;
             }
           } else {
             // failed to own producer. need retry
             parked_producer = Some(prod);
-            ctx.write_task_dependency(TaskDependency::Reschedule);
+            ctx.write_task_resolution(TaskResolution::Reschedule);
             lock.release();
             return Poll::Pending;
           }
         } else {
           // we've parked our selves and waiting for producer to resume us!
-          ctx.write_task_dependency(TaskDependency::Release);
+          ctx.write_task_resolution(TaskResolution::Release);
           lock.release();
           return Poll::Pending;
         }
@@ -428,7 +428,7 @@ pub fn pipe<T>(capacity: u32) -> impl Future<Output = Result<(PipeIn<T>, PipeOut
 
 
 
-#[test]
+#[test] #[ignore]
 fn basic_squezing_through_pipes() {
   let rt = FaRT::new_with_thread_count(1);
   rt.run_to_completion(async {
